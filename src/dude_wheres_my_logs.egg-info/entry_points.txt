@@ -1,0 +1,2 @@
+[console_scripts]
+DudeWheresMyLogs = dwml.__main__:main

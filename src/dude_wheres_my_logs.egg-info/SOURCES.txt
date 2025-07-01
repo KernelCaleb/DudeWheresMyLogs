@@ -1,0 +1,16 @@
+LICENSE
+README.md
+pyproject.toml
+setup.py
+src/dude_wheres_my_logs.egg-info/PKG-INFO
+src/dude_wheres_my_logs.egg-info/SOURCES.txt
+src/dude_wheres_my_logs.egg-info/dependency_links.txt
+src/dude_wheres_my_logs.egg-info/entry_points.txt
+src/dude_wheres_my_logs.egg-info/requires.txt
+src/dude_wheres_my_logs.egg-info/top_level.txt
+src/dwml/__init__.py
+src/dwml/__main__.py
+src/dwml/azure.py
+src/dwml/cli.py
+src/dwml/diagnostics.py
+src/dwml/reporting.py
