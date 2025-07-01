@@ -1,0 +1,56 @@
+Metadata-Version: 2.4
+Name: dude-wheres-my-logs
+Version: 0.1.0
+Summary: Azure Diagnostic Log Health Checker
+Home-page: https://github.com/KernelCaleb/DudeWheresMyLogs
+Author: Your Name
+Author-email: KernelCaleb <kernelcaleb@misconfigured.io>
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: System Administrators
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: azure-cli
+Dynamic: author
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-python
+
+# DudeWheresMyLogs
+
+## Overview
+DudeWheresMyLogs is a CLI tool designed to help administrators quickly identify and analyze diagnostic log settings across their Azure resources.
+
+## Features
+- Scan all resources in a subscription
+- Identify resources without diagnostic logging
+- Detect duplicate logging configurations
+- Export detailed results to CSV
+
+## Prerequisites
+- Python 3.8+
+- Azure CLI installed and configured
+
+## Installation
+```bash
+pip install .
+```
+
+## Usage
+```bash
+# Run the tool
+DudeWheresMyLogs
+```
+
+## Example Output
+- Displays a summary of resource types
+- Highlights resources with duplicate logging
+- Shows log destination statistics
+- Generates a CSV report
+
+## License
+GNU GPL v3
