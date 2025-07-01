@@ -30,8 +30,5 @@ DudeWheresMyLogs
 - Shows log destination statistics
 - Generates a CSV report
 
-## Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
-
 ## License
-[Your License Here]
+GPL-3.0
