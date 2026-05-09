@@ -1,6 +1,8 @@
 import csv
 import html
-from collections import Counter
+import json
+from collections import Counter, defaultdict
+from dataclasses import asdict
 from datetime import datetime
 
 
@@ -9,7 +11,7 @@ def generate_report(results, fmt="html", output=None):
 
     Args:
         results: list of DiagnosticResult objects
-        fmt: "html" or "csv"
+        fmt: "html", "csv", or "json"
         output: output file path (auto-generated if None)
 
     Returns:
@@ -21,10 +23,13 @@ def generate_report(results, fmt="html", output=None):
         if output is None:
             output = f"DudeWheresMyLogs_{timestamp}.csv"
         return generate_csv(results, output)
-    else:
+    if fmt == "json":
         if output is None:
-            output = f"DudeWheresMyLogs_{timestamp}.html"
-        return generate_html(results, output)
+            output = f"DudeWheresMyLogs_{timestamp}.json"
+        return generate_json(results, output)
+    if output is None:
+        output = f"DudeWheresMyLogs_{timestamp}.html"
+    return generate_html(results, output)
 
 
 def generate_csv(results, output):
@@ -44,7 +49,7 @@ def generate_csv(results, output):
         "Error",
     ]
 
-    with open(output, "w", newline="") as f:
+    with open(output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in results:
@@ -77,6 +82,27 @@ def generate_csv(results, output):
     return output
 
 
+def generate_json(results, output):
+    """Write results to a machine-readable JSON report."""
+    status_counts = Counter(r.status for r in results)
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "summary": {
+            "total_resources": len(results),
+            "subscriptions_scanned": len({r.subscription_id for r in results}),
+            "status_counts": dict(status_counts),
+            "duplicate_count": sum(1 for r in results if r.duplicate),
+        },
+        "results": [asdict(result) for result in results],
+    }
+
+    with open(output, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+    return output
+
+
 def _short_type(resource_type):
     """Strip the Microsoft. provider prefix for readability."""
     if resource_type.lower().startswith("microsoft."):
@@ -92,52 +118,487 @@ def _short_id(resource_id):
     return resource_id
 
 
-def _group_by_sub_and_type(items):
-    """Group results by subscription name, then by resource type.
+def _group_by_sub_rg(items):
+    """Group results by subscription, then resource group.
 
-    Returns: [(sub_name, sub_id, [(type, [results])])]
-    Sorted by subscription name, then type.
+    Returns: [(sub_name, sub_id, [(rg_name, [results])])]
+    Subscriptions sorted by name, RGs sorted by name, resources within an RG
+    sorted by type then name.
     """
-    from collections import defaultdict
-
     by_sub = defaultdict(lambda: defaultdict(list))
     sub_ids = {}
     for r in items:
-        by_sub[r.subscription_name][r.resource_type].append(r)
+        rg = r.resource_group or "(no resource group)"
+        by_sub[r.subscription_name][rg].append(r)
         sub_ids[r.subscription_name] = r.subscription_id
 
     grouped = []
-    for sub_name in sorted(by_sub):
-        types = []
-        for rtype in sorted(by_sub[sub_name]):
-            types.append((rtype, by_sub[sub_name][rtype]))
-        grouped.append((sub_name, sub_ids[sub_name], types))
+    for sub_name in sorted(by_sub, key=str.lower):
+        rgs = []
+        for rg in sorted(by_sub[sub_name], key=str.lower):
+            sorted_items = sorted(
+                by_sub[sub_name][rg],
+                key=lambda r: (r.resource_type.lower(), r.resource_name.lower()),
+            )
+            rgs.append((rg, sorted_items))
+        grouped.append((sub_name, sub_ids[sub_name], rgs))
     return grouped
 
 
-def _build_dest_map(results):
-    """Build a reverse map: destination -> resources streaming to it.
+def _build_dest_index(results):
+    """Build a list of unique destinations and the resources streaming to each.
 
-    Returns: [(dest_type, dest_name, dest_id, [(sub_name, sub_id, [(type, [results])])])]
-    Sorted by destination type then name.
+    Returns: list of dicts {type, name, region, id, resources}
+    sorted by descending resource count, then type, then name.
     """
-    from collections import defaultdict
-
     dest_to_results = defaultdict(list)
-    dest_names = {}
+    dest_meta = {}
     for r in results:
         for d in r.destinations:
             key = (d["type"], d["id"])
             dest_to_results[key].append(r)
-            if d.get("name"):
-                dest_names[key] = d["name"]
+            dest_meta[key] = {
+                "name": d.get("name", ""),
+                "region": d.get("region", ""),
+            }
 
-    dest_map = []
-    for (dtype, did) in sorted(dest_to_results):
-        dname = dest_names.get((dtype, did), "")
-        grouped = _group_by_sub_and_type(dest_to_results[(dtype, did)])
-        dest_map.append((dtype, dname, did, grouped))
-    return dest_map
+    items = []
+    for (dtype, did), rs in dest_to_results.items():
+        items.append({
+            "type": dtype,
+            "name": dest_meta[(dtype, did)]["name"],
+            "region": dest_meta[(dtype, did)]["region"],
+            "id": did,
+            "resources": rs,
+        })
+    items.sort(
+        key=lambda x: (-len(x["resources"]), x["type"].lower(), x["name"].lower()),
+    )
+    return items
+
+
+_CSS = """
+:root {
+  --text: #0f1419;
+  --text-soft: #5b6671;
+  --text-faint: #8b95a1;
+  --rule: #e1e6eb;
+  --rule-soft: #eef1f4;
+  --bg: #ffffff;
+  --bg-soft: #fafbfc;
+  --accent: #b54708;
+  --error: #991b1b;
+  --error-bg: #fef2f2;
+  --healthy: #15803d;
+  --duplicate: #b45309;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--bg); }
+body {
+  margin: 0;
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+  color: var(--text);
+}
+.report { max-width: 1180px; margin: 0 auto; padding: 36px 28px 64px; }
+
+/* Header */
+.hd { padding-bottom: 14px; border-bottom: 1px solid var(--rule); margin-bottom: 24px; }
+.hd .doc-class {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 4px;
+}
+.hd h1 { margin: 0 0 6px; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+.hd .meta { font-size: 12.5px; color: var(--text-soft); }
+.hd .meta strong { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+.hd .meta-sep { padding: 0 7px; color: var(--text-faint); }
+
+/* Section blocks: scope + findings overview */
+.block { margin-bottom: 24px; }
+.block-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+.scope-tbl { font-size: 12.5px; border-collapse: collapse; }
+.scope-tbl td { padding: 1px 18px 1px 0; vertical-align: top; }
+.scope-name { font-weight: 500; }
+.scope-id { font-family: var(--mono); font-size: 11.5px; color: var(--text-faint); }
+
+.overview-tbl {
+  font-size: 12.5px;
+  border-collapse: collapse;
+}
+.overview-tbl td {
+  padding: 2px 0 2px 0;
+  vertical-align: baseline;
+}
+.overview-tbl tr td:first-child {
+  color: var(--text-soft);
+  padding-right: 28px;
+  min-width: 180px;
+}
+.overview-tbl .v {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  text-align: right;
+  padding-right: 6px;
+  min-width: 44px;
+}
+.overview-tbl .v.f-warn { color: var(--accent); }
+.overview-tbl .v.f-dup { color: var(--duplicate); }
+.overview-tbl .v.f-err { color: var(--error); }
+.overview-tbl .v.f-ok { color: var(--healthy); }
+.overview-tbl .v.f-zero { color: var(--text-faint); font-weight: 400; }
+.overview-tbl a {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px dashed transparent;
+}
+.overview-tbl a:hover {
+  color: var(--text);
+  border-bottom-color: var(--text-faint);
+}
+
+/* Section anchor wrapper */
+.section-wrap { position: relative; }
+.section-wrap > .anchor {
+  position: absolute;
+  left: -22px;
+  top: 17px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-faint);
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.1s;
+  padding: 2px 4px;
+  z-index: 1;
+}
+.section-wrap:hover > .anchor,
+.section-wrap > .anchor:focus { opacity: 1; }
+.section-wrap > .anchor:hover { color: var(--text); }
+
+.section, .section-empty { scroll-margin-top: 18px; }
+.section:target,
+.section-empty:target { animation: target-flash 1.4s ease-out; }
+@keyframes target-flash {
+  0% { background: var(--rule-soft); }
+  100% { background: transparent; }
+}
+
+/* Finding section */
+.section {
+  margin: 0;
+  padding: 14px 0 6px;
+  border-top: 1px solid var(--rule);
+}
+.section.section-empty {
+  color: var(--text-faint);
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  padding: 14px 0 8px;
+}
+.section.section-empty .sec-num,
+.section.section-empty .sec-title { color: var(--text-faint); font-weight: 500; }
+.section.section-empty .sec-count { font-variant-numeric: tabular-nums; }
+.section.section-empty .sec-desc { color: var(--text-faint); margin-left: 6px; }
+
+.section > .sec-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  padding: 4px 0;
+}
+.section > .sec-summary::-webkit-details-marker { display: none; }
+.section > .sec-summary::before {
+  content: "\\203A";
+  display: inline-block;
+  width: 10px;
+  color: var(--text-faint);
+  font-size: 14px;
+  line-height: 1;
+  transition: transform 0.1s;
+  margin-top: 1px;
+  flex-shrink: 0;
+}
+.section[open] > .sec-summary::before { transform: rotate(90deg); }
+.sec-num { color: var(--text-faint); font-variant-numeric: tabular-nums; font-size: 13px; }
+.sec-title { font-size: 14px; font-weight: 600; }
+.sec-count {
+  color: var(--text-soft);
+  font-weight: 500;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.section.flag-warn .sec-count { color: var(--accent); }
+.section.flag-dup .sec-count { color: var(--duplicate); }
+.section.flag-err .sec-count { color: var(--error); }
+.section.flag-ok .sec-count { color: var(--healthy); }
+.sec-body { padding: 8px 0 6px 22px; }
+
+/* Subscription bar (multi-sub only) */
+.sub-bar {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  padding: 10px 0 4px;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.sub-bar:first-child { padding-top: 0; }
+.sub-name { font-weight: 600; }
+.sub-id { font-family: var(--mono); font-size: 11.5px; color: var(--text-faint); }
+.sub-count { color: var(--text-soft); font-size: 11.5px; margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* Resource group */
+.rg {
+  margin: 0;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.rg:last-child { border-bottom: none; }
+.rg > .rg-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  padding: 6px 0;
+}
+.rg > .rg-summary::-webkit-details-marker { display: none; }
+.rg > .rg-summary::before {
+  content: "\\203A";
+  display: inline-block;
+  width: 10px;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1;
+  transition: transform 0.1s;
+  flex-shrink: 0;
+}
+.rg[open] > .rg-summary::before { transform: rotate(90deg); }
+.rg-name { font-family: var(--mono); font-size: 12px; font-weight: 500; }
+.rg-count { color: var(--text-soft); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.rg-body { padding: 0 0 8px 22px; }
+
+/* Resource rows */
+.row-head, .row {
+  display: grid;
+  gap: 14px;
+  padding: 5px 0 5px 18px;
+  font-size: 12.5px;
+  align-items: baseline;
+}
+.row-cols-3 { grid-template-columns: minmax(170px, 240px) minmax(150px, 1fr) 90px; }
+.row-cols-4 { grid-template-columns: minmax(170px, 240px) minmax(150px, 1fr) 90px minmax(180px, 1.4fr); }
+.row-cols-dest { grid-template-columns: minmax(160px, 1.6fr) minmax(140px, 1fr) minmax(120px, 1fr) minmax(120px, 1fr) 90px; }
+.row-head {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding-top: 2px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--rule-soft);
+  font-weight: 600;
+}
+.row {
+  cursor: pointer;
+  list-style: none;
+  border-bottom: 1px solid var(--rule-soft);
+  position: relative;
+}
+.row::-webkit-details-marker { display: none; }
+.row::before {
+  content: "\\203A";
+  position: absolute;
+  left: 4px;
+  top: 5px;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1;
+  transition: transform 0.1s;
+}
+.resource[open] > .row::before { transform: rotate(90deg); }
+.resource[open] > .row { background: var(--bg-soft); }
+.rc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.rc.rc-type {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+.rc.rc-name { font-weight: 500; }
+.rc.rc-region {
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.rc.rc-detail { color: var(--text-soft); white-space: normal; }
+
+/* Row expand */
+.row-expand {
+  padding: 10px 0 14px 22px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--rule-soft);
+  font-size: 12px;
+}
+.full-id {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-soft);
+  word-break: break-all;
+  margin-bottom: 8px;
+  padding-right: 22px;
+}
+.empty-state {
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text-soft);
+  font-style: italic;
+}
+.err-msg {
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--error);
+  background: var(--error-bg);
+  border-left: 2px solid var(--error);
+  margin: 6px 22px 6px 0;
+  font-family: var(--mono);
+  word-break: break-word;
+}
+
+/* Settings table */
+.settings {
+  width: calc(100% - 22px);
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 11.5px;
+}
+.settings th, .settings td {
+  text-align: left;
+  padding: 5px 12px 5px 0;
+  border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top;
+}
+.settings th {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid var(--rule);
+}
+.settings tr:last-child td { border-bottom: none; }
+.settings .id-cell {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-soft);
+  word-break: break-all;
+  max-width: 280px;
+  cursor: help;
+}
+.settings .name-cell { font-weight: 500; }
+.settings .cats-cell { font-size: 11.5px; max-width: 320px; }
+.no-cats { color: var(--error); font-style: italic; }
+.la-tag {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 5px;
+  background: var(--rule-soft);
+  color: var(--text-soft);
+  font-size: 10px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
+/* Inline status text */
+.t-error { color: var(--error); font-weight: 500; }
+.t-info { color: var(--text-soft); }
+.dim { color: var(--text-faint); }
+
+/* Destination map */
+.dest {
+  border-bottom: 1px solid var(--rule-soft);
+  padding: 4px 0;
+}
+.dest:last-child { border-bottom: none; }
+.dest > .dest-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  padding: 6px 0 6px 18px;
+  position: relative;
+}
+.dest > .dest-summary::-webkit-details-marker { display: none; }
+.dest > .dest-summary::before {
+  content: "\\203A";
+  position: absolute;
+  left: 4px;
+  top: 7px;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1;
+  transition: transform 0.1s;
+}
+.dest[open] > .dest-summary::before { transform: rotate(90deg); }
+.dest-type {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-soft);
+  font-weight: 500;
+  min-width: 130px;
+}
+.dest-name { font-weight: 500; }
+.dest-region { color: var(--text-faint); font-family: var(--mono); font-size: 11.5px; }
+.dest-count { color: var(--text-soft); margin-left: auto; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.dest-body { padding: 4px 0 12px 22px; }
+
+/* Footer */
+.footer {
+  margin-top: 36px;
+  padding-top: 14px;
+  border-top: 1px solid var(--rule);
+  font-size: 11px;
+  color: var(--text-faint);
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+}
+
+/* Print */
+@media print {
+  body { font-size: 11px; color: #000; }
+  .report { padding: 12px 0 24px; max-width: none; }
+  .row, .rg, .section, .dest { break-inside: avoid; }
+}
+
+/* Narrow */
+@media (max-width: 800px) {
+  .report { padding: 22px 14px 40px; }
+  .row-cols-3, .row-cols-4, .row-cols-dest { grid-template-columns: 1fr; gap: 2px; }
+  .row-head { display: none; }
+  .row { padding-bottom: 8px; }
+  .full-id { padding-right: 0; }
+  .section-wrap > .anchor { display: none; }
+}
+"""
 
 
 def generate_html(results, output):
@@ -145,387 +606,390 @@ def generate_html(results, output):
     e = html.escape
     status_counts = Counter(r.status for r in results)
     total = len(results)
+    missing_count = status_counts.get("Missing", 0)
+    enabled_count = status_counts.get("Enabled", 0)
+    notsup_count = status_counts.get("Not Supported", 0)
+    error_count = status_counts.get("Error", 0)
     dup_count = sum(1 for r in results if r.duplicate)
-    subs = sorted({(r.subscription_name, r.subscription_id) for r in results})
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    healthy_count = max(enabled_count - dup_count, 0)
+    info_count = notsup_count + error_count
 
-    # Split results into buckets
-    missing = [r for r in results if r.status == "Missing"]
-    duplicates = [r for r in results if r.duplicate]
-    enabled = [r for r in results if r.status == "Enabled" and not r.duplicate]
-    informational = [r for r in results if r.status in ("Not Supported", "Error")]
+    subs = sorted(
+        {(r.subscription_name, r.subscription_id) for r in results},
+        key=lambda x: x[0].lower(),
+    )
+    multi_sub = len(subs) > 1
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Group each bucket
-    missing_grouped = _group_by_sub_and_type(missing)
-    dup_grouped = _group_by_sub_and_type(duplicates)
-    enabled_grouped = _group_by_sub_and_type(enabled)
-    info_grouped = _group_by_sub_and_type(informational)
+    missing_grouped = _group_by_sub_rg([r for r in results if r.status == "Missing"])
+    duplicate_grouped = _group_by_sub_rg([r for r in results if r.duplicate])
+    healthy_grouped = _group_by_sub_rg([
+        r for r in results if r.status == "Enabled" and not r.duplicate
+    ])
+    info_grouped = _group_by_sub_rg([
+        r for r in results if r.status in ("Not Supported", "Error")
+    ])
+    dest_index = _build_dest_index(results)
 
-    # Destination map
-    dest_map = _build_dest_map(results)
+    def _fmt_count(n, kind="default"):
+        if n == 0:
+            return '<td class="v f-zero">0</td>'
+        cls_map = {"warn": "f-warn", "dup": "f-dup", "err": "f-err", "ok": "f-ok"}
+        cls = cls_map.get(kind)
+        if cls:
+            return f'<td class="v {cls}">{n}</td>'
+        return f'<td class="v">{n}</td>'
 
-    def _resource_detail(r):
-        """Build a key-value detail grid for a resource."""
-        return (
-            '<div class="res-detail">'
-            "<table>"
-            f"<tr><td class='detail-key'>Resource Name</td><td>{e(r.resource_name)}</td></tr>"
-            f"<tr><td class='detail-key'>Resource Group</td><td>{e(r.resource_group)}</td></tr>"
-            f"<tr><td class='detail-key'>Resource Type</td><td>{e(_short_type(r.resource_type))}</td></tr>"
-            f"<tr><td class='detail-key'>Region</td><td>{e(r.resource_location)}</td></tr>"
-            f'<tr><td class="detail-key">Resource ID</td>'
-            f'<td class="res-id-full">{e(r.resource_id)}</td></tr>'
-            "</table></div>"
-        )
-
-    def _settings_table(destinations):
-        """Build the diagnostic settings table for a resource."""
+    def _build_settings_table(destinations):
         if not destinations:
             return ""
         rows = []
         for d in destinations:
             cats = d.get("log_categories", [])
-            cats_str = ", ".join(cats) if cats else '<span class="no-cats">None</span>'
-            la_type = e(d.get("la_destination_type", ""))
-            dtype = e(d.get("type", ""))
-            type_display = f'{dtype} <span class="la-type">({la_type})</span>' if la_type else dtype
-            region = e(d.get("region", ""))
+            cats_html = (
+                ", ".join(e(c) for c in cats)
+                if cats
+                else '<span class="no-cats">none</span>'
+            )
+            la_type = d.get("la_destination_type", "")
+            la_html = f'<span class="la-tag">{e(la_type)}</span>' if la_type else ""
             did = d.get("id", "")
             rows.append(
                 "<tr>"
-                f"<td>{e(d.get('setting_name', ''))}</td>"
-                f"<td>{type_display}</td>"
-                f"<td>{e(d.get('name', ''))}</td>"
-                f"<td>{region}</td>"
-                f'<td class="res-id" title="{e(did)}">{e(_short_id(did))}</td>'
-                f'<td class="cats-cell">{cats_str}</td>'
+                f'<td class="name-cell">{e(d.get("setting_name", ""))}</td>'
+                f"<td>{e(d.get('type', ''))}{la_html}</td>"
+                f'<td class="name-cell">{e(d.get("name", ""))}</td>'
+                f"<td>{e(d.get('region', ''))}</td>"
+                f'<td class="id-cell" title="{e(did)}">{e(_short_id(did))}</td>'
+                f'<td class="cats-cell">{cats_html}</td>'
                 "</tr>"
             )
         return (
-            '<div class="table-wrap"><table class="settings-table">'
+            '<table class="settings">'
             "<thead><tr>"
-            "<th>Setting Name</th><th>Destination Type</th>"
-            "<th>Destination Name</th><th>Destination Region</th>"
-            "<th>Destination ID</th><th>Log Categories</th>"
-            "</tr></thead><tbody>\n"
-            + "\n".join(rows)
-            + "\n</tbody></table></div>"
+            "<th>Setting</th><th>Type</th><th>Name</th>"
+            "<th>Region</th><th>ID</th><th>Categories</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table>"
         )
 
-    def _resource_block(r, open_by_default=False):
-        """Build a collapsible block for a single resource."""
-        open_attr = " open" if open_by_default else ""
-        setting_count = len(r.destinations)
-        label = f"{setting_count} setting{'s' if setting_count != 1 else ''}" if setting_count else "no settings"
-        block = (
-            f"<details class='resource-block'{open_attr}>\n"
-            f'<summary class="resource-header">'
-            f'{e(r.resource_name)}'
-            f'<span class="res-meta">{e(r.resource_group)} | {e(r.resource_location)}</span>'
-            f'<span class="badge-sm">{label}</span>'
-            f"</summary>\n"
-            f"{_resource_detail(r)}\n"
-        )
-        if r.destinations:
-            block += _settings_table(r.destinations)
+    def _render_destinations_inline(destinations):
+        if not destinations:
+            return '<span class="dim">&mdash;</span>'
+        type_to_count = defaultdict(int)
+        type_to_first_name = {}
+        for d in destinations:
+            type_to_count[d["type"]] += 1
+            type_to_first_name.setdefault(
+                d["type"],
+                d.get("name") or _short_id(d.get("id", "")),
+            )
+        parts = []
+        for dtype, count in type_to_count.items():
+            if count > 1:
+                parts.append(f'{e(dtype)} <span class="dim">&times;{count}</span>')
+            else:
+                name = type_to_first_name[dtype]
+                parts.append(f"{e(dtype)}: {e(name)}")
+        return " &middot; ".join(parts)
+
+    def _build_resource_row(r, kind):
+        rtype = e(_short_type(r.resource_type))
+        rname = e(r.resource_name)
+        rregion = e(r.resource_location)
+        full_type_attr = e(r.resource_type)
+
+        if kind == "missing":
+            cols_html = (
+                f'<span class="rc rc-type" title="{full_type_attr}">{rtype}</span>'
+                f'<span class="rc rc-name">{rname}</span>'
+                f'<span class="rc rc-region">{rregion}</span>'
+            )
+            cols_class = "row-cols-3"
+        elif kind in ("duplicate", "healthy"):
+            cols_html = (
+                f'<span class="rc rc-type" title="{full_type_attr}">{rtype}</span>'
+                f'<span class="rc rc-name">{rname}</span>'
+                f'<span class="rc rc-region">{rregion}</span>'
+                f'<span class="rc rc-detail">{_render_destinations_inline(r.destinations)}</span>'
+            )
+            cols_class = "row-cols-4"
+        else:  # info
+            if r.status == "Error":
+                detail_html = '<span class="t-error">Error</span>'
+            else:
+                detail_html = '<span class="t-info">Not supported</span>'
+            cols_html = (
+                f'<span class="rc rc-type" title="{full_type_attr}">{rtype}</span>'
+                f'<span class="rc rc-name">{rname}</span>'
+                f'<span class="rc rc-region">{rregion}</span>'
+                f'<span class="rc rc-detail">{detail_html}</span>'
+            )
+            cols_class = "row-cols-4"
+
+        expand_parts = [f'<div class="full-id">{e(r.resource_id)}</div>']
         if r.error_message:
-            block += f'<div class="error-msg">{e(r.error_message)}</div>'
-        block += "\n</details>\n"
-        return block
+            expand_parts.append(f'<div class="err-msg">{e(r.error_message)}</div>')
+        if r.destinations:
+            expand_parts.append(_build_settings_table(r.destinations))
+        elif r.status == "Missing":
+            expand_parts.append(
+                '<div class="empty-state">No diagnostic settings configured.</div>'
+            )
+        elif r.status == "Not Supported":
+            expand_parts.append(
+                '<div class="empty-state">'
+                "This resource type does not support diagnostic settings."
+                "</div>"
+            )
 
-    def build_section(title, badge_count, accent_color, grouped,
-                      open_by_default=True, show_settings=True):
-        """Build a collapsible section with sub/type grouping and per-resource blocks."""
-        if not grouped:
-            return ""
-
-        open_attr = " open" if open_by_default else ""
-        section_html = (
-            f'<section class="report-section" style="border-left: 4px solid {accent_color};">\n'
-            f"<details{open_attr}>\n"
-            f'<summary class="section-header">'
-            f"{e(title)}"
-            f'<span class="badge" style="background: {accent_color};">{badge_count}</span>'
-            f"</summary>\n"
-            f'<div class="section-body">\n'
+        return (
+            '<details class="resource">'
+            f'<summary class="row {cols_class}">{cols_html}</summary>'
+            f'<div class="row-expand">{"".join(expand_parts)}</div>'
+            "</details>"
         )
 
-        for sub_name, sub_id, types in grouped:
-            sub_count = sum(len(items) for _, items in types)
-            section_html += (
-                f"<details{open_attr}>\n"
-                f'<summary class="sub-header">'
-                f"{e(sub_name)}"
-                f'<span class="sub-id">{e(sub_id)}</span>'
-                f'<span class="badge-sm">{sub_count}</span>'
-                f"</summary>\n"
-                f'<div class="sub-body">\n'
+    def _build_rg_block(rg, items, kind):
+        if kind == "missing":
+            head_html = (
+                '<div class="row-head row-cols-3">'
+                "<span>Type</span><span>Name</span><span>Region</span>"
+                "</div>"
+            )
+        elif kind in ("duplicate", "healthy"):
+            head_html = (
+                '<div class="row-head row-cols-4">'
+                "<span>Type</span><span>Name</span><span>Region</span><span>Destinations</span>"
+                "</div>"
+            )
+        else:
+            head_html = (
+                '<div class="row-head row-cols-4">'
+                "<span>Type</span><span>Name</span><span>Region</span><span>Status</span>"
+                "</div>"
             )
 
-            for rtype, items in types:
-                section_html += (
-                    f"<details{open_attr}>\n"
-                    f'<summary class="type-header">'
-                    f"{e(_short_type(rtype))}"
-                    f'<span class="badge-sm">{len(items)}</span>'
-                    f"</summary>\n"
-                    f'<div class="type-body">\n'
-                )
-                for r in items:
-                    section_html += _resource_block(r, open_by_default=open_by_default)
-                section_html += "</div>\n</details>\n"
-
-            section_html += "</div>\n</details>\n"
-
-        section_html += "</div>\n</details>\n</section>\n"
-        return section_html
-
-    def build_dest_map_section():
-        if not dest_map:
-            return ""
-
-        section_html = (
-            '<section class="report-section" style="border-left: 4px solid #2980b9;">\n'
-            "<details>\n"
-            '<summary class="section-header">'
-            "Destination Map"
-            f'<span class="badge" style="background: #2980b9;">{len(dest_map)}</span>'
-            "</summary>\n"
-            '<div class="section-body">\n'
+        rows_html = "".join(_build_resource_row(r, kind) for r in items)
+        return (
+            '<details class="rg" open>'
+            '<summary class="rg-summary">'
+            f'<span class="rg-name">{e(rg)}</span>'
+            f'<span class="rg-count">{len(items)}</span>'
+            "</summary>"
+            f'<div class="rg-body">{head_html}{rows_html}</div>'
+            "</details>"
         )
 
-        for dtype, dname, did, grouped in dest_map:
-            total_resources = sum(
-                len(items) for _, _, types in grouped for _, items in types
-            )
-            display_name = dname if dname else _short_id(did)
-            # Look up region from any result that has this destination
-            dest_region = ""
-            for _, _, types in grouped:
-                for _, items in types:
-                    for r in items:
-                        for d in r.destinations:
-                            if d.get("id") == did and d.get("region"):
-                                dest_region = d["region"]
-                                break
-                        if dest_region:
-                            break
-                    if dest_region:
-                        break
-                if dest_region:
-                    break
-
-            region_label = f' <span class="res-meta">({dest_region})</span>' if dest_region else ""
-            section_html += (
-                f"<details>\n"
-                f'<summary class="sub-header">'
-                f'{e(dtype)}: <span class="dest-name">{e(display_name)}</span>'
-                f'{region_label}'
-                f'<span class="badge-sm">{total_resources} resources</span>'
-                f"</summary>\n"
-                f'<div class="dest-full-id">{e(did)}</div>\n'
-                f'<div class="sub-body">\n'
+    def _build_section(num, title, count, grouped, *, kind, default_open, severity, anchor):
+        flag_class = f" flag-{severity}" if severity else ""
+        anchor_link = f'<a class="anchor" href="#{anchor}" aria-label="link to {e(title)}">#</a>'
+        if count == 0:
+            return (
+                '<div class="section-wrap">'
+                f"{anchor_link}"
+                f'<section class="section section-empty{flag_class}" id="{anchor}">'
+                f'<span class="sec-num">{num}.</span>'
+                f'<span class="sec-title">{e(title)}</span>'
+                '<span class="sec-count">0</span>'
+                '<span class="sec-desc">none</span>'
+                "</section>"
+                "</div>"
             )
 
-            for sub_name, sub_id, types in grouped:
-                sub_count = sum(len(items) for _, items in types)
-                section_html += (
-                    f"<details>\n"
-                    f'<summary class="type-header">'
-                    f"{e(sub_name)}"
-                    f'<span class="badge-sm">{sub_count}</span>'
-                    f"</summary>\n"
+        open_attr = " open" if default_open else ""
+        body_parts = []
+        for sub_name, sub_id, rgs in grouped:
+            if multi_sub:
+                sub_total = sum(len(items) for _, items in rgs)
+                body_parts.append(
+                    '<div class="sub-bar">'
+                    f'<span class="sub-name">{e(sub_name)}</span>'
+                    f'<span class="sub-id">{e(sub_id)}</span>'
+                    f'<span class="sub-count">{sub_total}</span>'
+                    "</div>"
                 )
+            for rg, items in rgs:
+                body_parts.append(_build_rg_block(rg, items, kind))
 
-                for rtype, items in types:
-                    section_html += (
-                        f'<div class="dest-type-group">'
-                        f'<div class="dest-type-label">{e(_short_type(rtype))}'
-                        f'<span class="badge-sm">{len(items)}</span></div>\n'
-                        f'<div class="table-wrap"><table>\n'
-                        f"<thead><tr>"
-                        f"<th>Resource Name</th><th>Resource Group</th>"
-                        f"<th>Region</th><th>Resource ID</th>"
-                        f"</tr></thead>\n<tbody>\n"
-                    )
-                    for r in items:
-                        section_html += (
-                            f"<tr><td>{e(r.resource_name)}</td>"
-                            f"<td>{e(r.resource_group)}</td>"
-                            f"<td>{e(r.resource_location)}</td>"
-                            f'<td class="res-id" title="{e(r.resource_id)}">'
-                            f"{e(_short_id(r.resource_id))}</td></tr>\n"
-                        )
-                    section_html += "</tbody></table></div></div>\n"
+        return (
+            '<div class="section-wrap">'
+            f"{anchor_link}"
+            f'<details class="section{flag_class}"{open_attr} id="{anchor}">'
+            '<summary class="sec-summary">'
+            f'<span class="sec-num">{num}.</span>'
+            f'<span class="sec-title">{e(title)}</span>'
+            f'<span class="sec-count">{count}</span>'
+            "</summary>"
+            f'<div class="sec-body">{"".join(body_parts)}</div>'
+            "</details>"
+            "</div>"
+        )
 
-                section_html += "</details>\n"
+    def _build_dest_section(num, anchor):
+        anchor_link = f'<a class="anchor" href="#{anchor}" aria-label="link to Destination Map">#</a>'
+        if not dest_index:
+            return (
+                '<div class="section-wrap">'
+                f"{anchor_link}"
+                f'<section class="section section-empty" id="{anchor}">'
+                f'<span class="sec-num">{num}.</span>'
+                '<span class="sec-title">Destination Map</span>'
+                '<span class="sec-count">0</span>'
+                '<span class="sec-desc">no destinations</span>'
+                "</section>"
+                "</div>"
+            )
 
-            section_html += "</div>\n</details>\n"
+        items_html = []
+        for d in dest_index:
+            display_name = d["name"] or _short_id(d["id"])
+            region_html = (
+                f'<span class="dest-region">{e(d["region"])}</span>'
+                if d["region"] else ""
+            )
+            resources_sorted = sorted(
+                d["resources"],
+                key=lambda r: (
+                    r.subscription_name.lower(),
+                    r.resource_group.lower(),
+                    r.resource_type.lower(),
+                    r.resource_name.lower(),
+                ),
+            )
+            res_rows = "".join(
+                '<div class="row row-cols-dest">'
+                f'<span class="rc rc-name">{e(r.resource_name)}</span>'
+                f'<span class="rc rc-type" title="{e(r.resource_type)}">{e(_short_type(r.resource_type))}</span>'
+                f'<span class="rc">{e(r.resource_group)}</span>'
+                f'<span class="rc">{e(r.subscription_name)}</span>'
+                f'<span class="rc rc-region">{e(r.resource_location)}</span>'
+                "</div>"
+                for r in resources_sorted
+            )
+            items_html.append(
+                '<details class="dest">'
+                '<summary class="dest-summary">'
+                f'<span class="dest-type">{e(d["type"])}</span>'
+                f'<span class="dest-name">{e(display_name)}</span>'
+                f"{region_html}"
+                f'<span class="dest-count">{len(d["resources"])} resources</span>'
+                "</summary>"
+                '<div class="dest-body">'
+                f'<div class="full-id">{e(d["id"])}</div>'
+                '<div class="row-head row-cols-dest">'
+                "<span>Resource</span><span>Type</span><span>Resource Group</span>"
+                "<span>Subscription</span><span>Region</span>"
+                "</div>"
+                f"{res_rows}"
+                "</div></details>"
+            )
 
-        section_html += "</div>\n</details>\n</section>\n"
-        return section_html
+        return (
+            '<div class="section-wrap">'
+            f"{anchor_link}"
+            f'<details class="section" id="{anchor}">'
+            '<summary class="sec-summary">'
+            f'<span class="sec-num">{num}.</span>'
+            '<span class="sec-title">Destination Map</span>'
+            f'<span class="sec-count">{len(dest_index)}</span>'
+            "</summary>"
+            f'<div class="sec-body">{"".join(items_html)}</div>'
+            "</details>"
+            "</div>"
+        )
 
-    # Subscriptions scanned
-    sub_rows = ""
-    for name, sid in subs:
-        sub_rows += f"<tr><td>{e(name)}</td><td>{e(sid)}</td></tr>\n"
-
-    missing_section = build_section(
-        "Action Required: Missing Diagnostics",
-        len(missing), "#c0392b", missing_grouped,
-        open_by_default=True,
+    scope_rows = "".join(
+        f'<tr><td class="scope-name">{e(name)}</td>'
+        f'<td class="scope-id">{e(sid)}</td></tr>'
+        for name, sid in subs
     )
-    dup_section = build_section(
-        "Action Required: Duplicate Shipping",
-        len(duplicates), "#e67e22", dup_grouped,
-        open_by_default=True,
-    )
-    enabled_section = build_section(
-        "Healthy: Enabled Diagnostics",
-        len(enabled), "#27ae60", enabled_grouped,
-        open_by_default=False,
-    )
-    info_section = build_section(
-        "Informational: Not Supported / Errors",
-        len(informational), "#95a5a6", info_grouped,
-        open_by_default=False,
-    )
-    dest_section = build_dest_map_section()
 
-    report_html = f"""<!DOCTYPE html>
+    overview_rows = (
+        f'<tr><td><a href="#missing">Missing diagnostics</a></td>{_fmt_count(missing_count, "warn")}</tr>'
+        f'<tr><td><a href="#duplicate">Duplicate shipping</a></td>{_fmt_count(dup_count, "dup")}</tr>'
+        f'<tr><td><a href="#healthy">Healthy</a></td>{_fmt_count(healthy_count, "ok")}</tr>'
+        f'<tr><td><a href="#informational">Not supported</a></td>{_fmt_count(notsup_count)}</tr>'
+        f'<tr><td><a href="#informational">Errors</a></td>{_fmt_count(error_count, "err")}</tr>'
+    )
+
+    s1 = _build_section(
+        1, "Missing Diagnostics", missing_count, missing_grouped,
+        kind="missing", default_open=missing_count > 0, severity="warn",
+        anchor="missing",
+    )
+    s2 = _build_section(
+        2, "Duplicate Shipping", dup_count, duplicate_grouped,
+        kind="duplicate", default_open=dup_count > 0, severity="dup",
+        anchor="duplicate",
+    )
+    s3 = _build_section(
+        3, "Healthy Resources", healthy_count, healthy_grouped,
+        kind="healthy", default_open=False,
+        severity="ok" if healthy_count > 0 else None,
+        anchor="healthy",
+    )
+    s4 = _build_section(
+        4, "Informational", info_count, info_grouped,
+        kind="info", default_open=False,
+        severity="err" if error_count > 0 else None,
+        anchor="informational",
+    )
+    s5 = _build_dest_section(5, anchor="destinations")
+
+    sub_label = "subscription" if len(subs) == 1 else "subscriptions"
+    res_label = "resource" if total == 1 else "resources"
+
+    body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DudeWheresMyLogs Report</title>
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; color: #333; padding: 0; }}
-.report-header {{ background: #1a1a2e; color: #fff; padding: 24px 32px; }}
-.report-header h1 {{ font-size: 1.5em; font-weight: 600; margin-bottom: 4px; }}
-.report-header .subtitle {{ color: #a0a0b8; font-size: 0.85em; }}
-.report-body {{ max-width: 1400px; margin: 0 auto; padding: 24px; }}
-
-.cards {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }}
-.card {{ background: #fff; border-radius: 8px; padding: 16px 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); min-width: 140px; border-left: 4px solid #ddd; }}
-.card .num {{ font-size: 2em; font-weight: 700; line-height: 1.1; }}
-.card .label {{ color: #666; font-size: 0.85em; margin-top: 2px; }}
-.card.missing {{ border-left-color: #c0392b; }}
-.card.missing .num {{ color: #c0392b; }}
-.card.dup {{ border-left-color: #e67e22; }}
-.card.dup .num {{ color: #e67e22; }}
-.card.enabled {{ border-left-color: #27ae60; }}
-.card.enabled .num {{ color: #27ae60; }}
-.card.notsup {{ border-left-color: #95a5a6; }}
-.card.notsup .num {{ color: #95a5a6; }}
-.card.err {{ border-left-color: #8e44ad; }}
-.card.err .num {{ color: #8e44ad; }}
-
-.report-section {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 20px; overflow: hidden; }}
-.section-header {{ font-size: 1.1em; font-weight: 600; padding: 16px 20px; cursor: pointer; user-select: none; display: flex; align-items: center; gap: 10px; list-style: none; }}
-.section-header::-webkit-details-marker {{ display: none; }}
-.section-header::before {{ content: ""; display: inline-block; width: 0; height: 0; border-left: 6px solid #666; border-top: 5px solid transparent; border-bottom: 5px solid transparent; transition: transform 0.15s; flex-shrink: 0; }}
-details[open] > .section-header::before {{ transform: rotate(90deg); }}
-.section-body {{ padding: 0 20px 16px; }}
-
-.badge {{ display: inline-flex; align-items: center; justify-content: center; color: #fff; font-size: 0.75em; font-weight: 600; padding: 2px 10px; border-radius: 12px; margin-left: auto; }}
-.badge-sm {{ display: inline-flex; align-items: center; justify-content: center; background: #e8e8e8; color: #555; font-size: 0.75em; font-weight: 600; padding: 1px 8px; border-radius: 10px; margin-left: 8px; }}
-
-.sub-header {{ font-size: 0.95em; font-weight: 600; padding: 10px 8px; cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px; list-style: none; border-bottom: 1px solid #f0f0f0; }}
-.sub-header::-webkit-details-marker {{ display: none; }}
-.sub-header::before {{ content: ""; display: inline-block; width: 0; height: 0; border-left: 5px solid #999; border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform 0.15s; flex-shrink: 0; }}
-details[open] > .sub-header::before {{ transform: rotate(90deg); }}
-.sub-id {{ color: #999; font-weight: 400; font-size: 0.85em; font-family: monospace; }}
-.sub-body {{ padding-left: 16px; }}
-
-.type-header {{ font-size: 0.85em; font-weight: 500; padding: 8px 4px; cursor: pointer; user-select: none; color: #555; display: flex; align-items: center; gap: 6px; list-style: none; font-family: monospace; }}
-.type-header::-webkit-details-marker {{ display: none; }}
-.type-header::before {{ content: ""; display: inline-block; width: 0; height: 0; border-left: 4px solid #bbb; border-top: 3px solid transparent; border-bottom: 3px solid transparent; transition: transform 0.15s; flex-shrink: 0; }}
-details[open] > .type-header::before {{ transform: rotate(90deg); }}
-.type-body {{ padding-left: 8px; }}
-
-.resource-block {{ margin: 4px 0; border: 1px solid #eee; border-radius: 6px; }}
-.resource-header {{ font-size: 0.85em; font-weight: 500; padding: 8px 12px; cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px; list-style: none; }}
-.resource-header::-webkit-details-marker {{ display: none; }}
-.resource-header::before {{ content: ""; display: inline-block; width: 0; height: 0; border-left: 4px solid #bbb; border-top: 3px solid transparent; border-bottom: 3px solid transparent; transition: transform 0.15s; flex-shrink: 0; }}
-details[open] > .resource-header::before {{ transform: rotate(90deg); }}
-.resource-block[open] {{ border-color: #ddd; background: #fcfcfc; }}
-.res-meta {{ color: #999; font-weight: 400; font-size: 0.85em; }}
-
-.res-detail {{ padding: 8px 12px; }}
-.res-detail table {{ margin: 0; width: auto; }}
-.res-detail td {{ border: none; padding: 2px 12px 2px 0; font-size: 0.8em; }}
-.detail-key {{ color: #888; font-weight: 600; text-transform: uppercase; font-size: 0.7em; letter-spacing: 0.03em; white-space: nowrap; }}
-.res-id-full {{ font-family: monospace; font-size: 0.8em; color: #666; word-break: break-all; }}
-
-.settings-table {{ margin: 8px 12px 12px; border: 1px solid #e8e8e8; border-radius: 4px; width: calc(100% - 24px); }}
-.settings-table th {{ font-size: 0.7em; padding: 4px 10px; background: #f5f5f5; text-transform: uppercase; letter-spacing: 0.03em; }}
-.settings-table td {{ font-size: 0.8em; padding: 4px 10px; border-bottom: 1px solid #f0f0f0; }}
-.settings-table tr:last-child td {{ border-bottom: none; }}
-
-.table-wrap {{ overflow-x: auto; }}
-table {{ width: 100%; border-collapse: collapse; margin-bottom: 8px; }}
-th, td {{ text-align: left; padding: 6px 12px; border-bottom: 1px solid #f0f0f0; font-size: 0.85em; }}
-th {{ background: #fafafa; font-weight: 600; color: #555; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.03em; }}
-.res-id {{ font-family: monospace; font-size: 0.8em; color: #888; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }}
-.res-id:hover {{ white-space: normal; overflow: visible; color: #333; }}
-.cats-cell {{ font-size: 0.75em; max-width: 300px; }}
-.no-cats {{ color: #c0392b; font-weight: 500; }}
-.la-type {{ color: #2980b9; font-size: 0.85em; font-weight: 400; }}
-.error-msg {{ padding: 8px 12px; font-size: 0.8em; color: #c0392b; background: #fdecea; border-radius: 4px; margin: 4px 12px 12px; }}
-
-.subs-section {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 20px; border-left: 4px solid #34495e; }}
-.subs-section details {{ padding: 0; }}
-.subs-section .section-body {{ padding: 0 20px 12px; }}
-.subs-section table th {{ background: #fafafa; }}
-
-.dest-full-id {{ font-family: monospace; font-size: 0.75em; color: #999; padding: 0 12px 8px; word-break: break-all; }}
-.dest-name {{ font-family: monospace; font-weight: 400; }}
-.dest-type-group {{ margin-left: 16px; margin-bottom: 8px; }}
-.dest-type-label {{ font-family: monospace; font-size: 0.8em; color: #666; padding: 4px 0; font-weight: 500; }}
-
-.report-footer {{ text-align: center; color: #999; font-size: 0.8em; padding: 16px; }}
-</style>
+<title>Diagnostic Settings Audit &middot; DudeWheresMyLogs</title>
+<style>{_CSS}</style>
 </head>
 <body>
-<div class="report-header">
-  <h1>DudeWheresMyLogs Report</h1>
-  <div class="subtitle">Generated {timestamp} | {len(subs)} subscription{"s" if len(subs) != 1 else ""} scanned | {total} resources evaluated</div>
-</div>
+<div class="report">
 
-<div class="report-body">
+<header class="hd">
+  <div class="doc-class">DudeWheresMyLogs &middot; audit report</div>
+  <h1>Azure Diagnostic Settings Audit</h1>
+  <div class="meta">
+    Generated <strong>{timestamp}</strong>
+    <span class="meta-sep">&middot;</span>
+    <strong>{len(subs)}</strong> {sub_label}
+    <span class="meta-sep">&middot;</span>
+    <strong>{total}</strong> {res_label} evaluated
+  </div>
+</header>
 
-<div class="cards">
-  <div class="card"><div class="num">{total}</div><div class="label">Total Resources</div></div>
-  <div class="card missing"><div class="num">{status_counts.get("Missing", 0)}</div><div class="label">Missing Diagnostics</div></div>
-  <div class="card dup"><div class="num">{dup_count}</div><div class="label">Duplicate Shipping</div></div>
-  <div class="card enabled"><div class="num">{status_counts.get("Enabled", 0) - dup_count}</div><div class="label">Healthy</div></div>
-  <div class="card notsup"><div class="num">{status_counts.get("Not Supported", 0)}</div><div class="label">Not Supported</div></div>
-  <div class="card err"><div class="num">{status_counts.get("Error", 0)}</div><div class="label">Errors</div></div>
-</div>
+<section class="block">
+  <div class="block-label">Scope</div>
+  <table class="scope-tbl"><tbody>{scope_rows}</tbody></table>
+</section>
 
-<div class="subs-section">
-<details>
-<summary class="section-header">Subscriptions Scanned<span class="badge" style="background: #34495e;">{len(subs)}</span></summary>
-<div class="section-body">
-<table><thead><tr><th>Name</th><th>Subscription ID</th></tr></thead>
-<tbody>{sub_rows}</tbody></table>
-</div>
-</details>
-</div>
+<section class="block">
+  <div class="block-label">Findings overview</div>
+  <table class="overview-tbl"><tbody>{overview_rows}</tbody></table>
+</section>
 
-{missing_section}
-{dup_section}
-{enabled_section}
-{info_section}
-{dest_section}
+{s1}
+{s2}
+{s3}
+{s4}
+{s5}
 
-<div class="report-footer">DudeWheresMyLogs -- Azure Diagnostic Logging Audit</div>
+<footer class="footer">
+  <span>DudeWheresMyLogs &middot; Azure Diagnostic Logging Audit</span>
+  <span>{timestamp}</span>
+</footer>
+
 </div>
 </body>
-</html>"""
+</html>
+"""
 
-    with open(output, "w") as f:
-        f.write(report_html)
-
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(body)
     return output

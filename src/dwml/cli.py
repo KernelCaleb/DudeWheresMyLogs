@@ -1,10 +1,9 @@
 import argparse
+import fnmatch
 import sys
 from collections import Counter
 
 from . import __version__
-from .azure import get_credential, list_subscriptions, list_resources
-from .diagnostics import check_all_diagnostics
 from .reporting import generate_report
 
 
@@ -31,7 +30,7 @@ def build_parser():
     )
     parser.add_argument(
         "-f", "--format",
-        choices=["html", "csv"],
+        choices=["html", "csv", "json"],
         default="html",
         help="Output format (default: html).",
     )
@@ -48,11 +47,90 @@ def build_parser():
         help="Number of parallel workers (default: 10).",
     )
     parser.add_argument(
+        "--include-types",
+        action="append",
+        metavar="PATTERN",
+        help="Only scan matching resource types. Supports wildcards and can be repeated.",
+    )
+    parser.add_argument(
+        "--exclude-types",
+        action="append",
+        metavar="PATTERN",
+        help="Skip matching resource types. Supports wildcards and can be repeated.",
+    )
+    parser.add_argument(
+        "--resource-group",
+        action="append",
+        metavar="NAME",
+        help="Only scan resources in matching resource groups. Supports wildcards and can be repeated.",
+    )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Use CI-friendly exit codes: 0=clean, 1=findings, 2=errors.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
     return parser
+
+
+def _normalize_patterns(values):
+    """Flatten repeated and comma-separated CLI pattern values."""
+    if not values:
+        return []
+    patterns = []
+    for value in values:
+        parts = [part.strip() for part in value.split(",")]
+        patterns.extend(part for part in parts if part)
+    return patterns
+
+
+def _matches_any(value, patterns):
+    """Case-insensitive wildcard/exact match against any pattern."""
+    normalized = value.lower()
+    return any(fnmatch.fnmatch(normalized, pattern.lower()) for pattern in patterns)
+
+
+def filter_resources(resources, include_types=None, exclude_types=None, resource_groups=None):
+    """Filter resources by type and resource group."""
+    include_types = _normalize_patterns(include_types)
+    exclude_types = _normalize_patterns(exclude_types)
+    resource_groups = _normalize_patterns(resource_groups)
+
+    filtered = []
+    for resource in resources:
+        resource_type = resource.get("type", "")
+        resource_group = resource.get("resource_group", "")
+
+        if include_types and not _matches_any(resource_type, include_types):
+            continue
+        if exclude_types and _matches_any(resource_type, exclude_types):
+            continue
+        if resource_groups and not _matches_any(resource_group, resource_groups):
+            continue
+
+        filtered.append(resource)
+
+    return filtered
+
+
+def _determine_exit_code(results, ci_mode=False):
+    """Return the appropriate process exit code for the scan results."""
+    if not ci_mode:
+        return 0
+
+    has_errors = any(result.status == "Error" for result in results)
+    if has_errors:
+        return 2
+
+    has_findings = any(
+        result.status == "Missing" or result.duplicate
+        for result in results
+    )
+    return 1 if has_findings else 0
 
 
 def select_subscriptions_interactive(subscriptions):
@@ -82,10 +160,13 @@ def select_subscriptions_interactive(subscriptions):
             print("Enter a number, A, or Q.")
 
 
-def main():
-    """Entry point for DudeWheresMyLogs."""
+def run(argv=None):
+    """Run DudeWheresMyLogs and return a process exit code."""
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    from .azure import get_credential, list_resources, list_subscriptions
+    from .diagnostics import check_all_diagnostics
 
     print(f"DudeWheresMyLogs v{__version__}")
     print("Azure Diagnostic Logging Auditor\n")
@@ -98,7 +179,7 @@ def main():
     all_subs = list_subscriptions(credential)
     if not all_subs:
         print("No subscriptions found.")
-        sys.exit(1)
+        return 1
 
     if args.all_subs:
         selected = all_subs
@@ -113,7 +194,7 @@ def main():
                 print(f"Warning: subscription {sid} not found or not accessible, skipping.")
         if not selected:
             print("No valid subscriptions to scan.")
-            sys.exit(1)
+            return 1
     else:
         selected = select_subscriptions_interactive(all_subs)
 
@@ -126,7 +207,14 @@ def main():
         sys.stderr.write("Enumerating resources... ")
         sys.stderr.flush()
         resources = list_resources(credential, sub["id"])
-        sys.stderr.write(f"found {len(resources)} resources.\n")
+        total_resources = len(resources)
+        resources = filter_resources(
+            resources,
+            include_types=args.include_types,
+            exclude_types=args.exclude_types,
+            resource_groups=args.resource_group,
+        )
+        sys.stderr.write(f"found {total_resources} resources, scanning {len(resources)} after filters.\n")
         sys.stderr.flush()
 
         if not resources:
@@ -142,7 +230,7 @@ def main():
 
     if not all_results:
         print("No results to report.")
-        sys.exit(0)
+        return 0
 
     # Print summary
     status_counts = Counter(r.status for r in all_results)
@@ -159,3 +247,9 @@ def main():
     # Generate report
     output_path = generate_report(all_results, fmt=args.format, output=args.output)
     print(f"\nReport saved to: {output_path}")
+    return _determine_exit_code(all_results, ci_mode=args.ci)
+
+
+def main():
+    """CLI entry point."""
+    sys.exit(run())

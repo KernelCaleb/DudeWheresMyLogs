@@ -11,8 +11,11 @@ DudeWheresMyLogs is a Python CLI tool that audits Azure diagnostic logging confi
 - Storage account sub-service scanning (blob, queue, table, file)
 - Parallel scanning with configurable worker count
 - Retry with exponential backoff for Azure ARM throttling (enterprise-scale ready)
-- HTML report with filtering, sorting, and color-coded status rows
+- HTML audit report with numbered sections, collapsible groupings, and in-page anchor links
 - CSV export for further analysis
+- JSON export for automation, diffing, and CI workflows
+- Resource filtering by type and resource group
+- CI mode with meaningful exit codes for scheduled scans
 
 ## Prerequisites
 - Python 3.9+
@@ -51,14 +54,21 @@ DudeWheresMyLogs -a
 DudeWheresMyLogs -s <subscription-id>
 DudeWheresMyLogs -s <sub-1> -s <sub-2>
 
-# Output as CSV instead of HTML
+# Output as CSV or JSON instead of HTML
 DudeWheresMyLogs -f csv
+DudeWheresMyLogs -f json
 
 # Specify output file
 DudeWheresMyLogs -o report.html
 
 # Adjust parallel workers (default: 10)
 DudeWheresMyLogs -w 20
+
+# Scope the scan to specific resources
+DudeWheresMyLogs --include-types "Microsoft.KeyVault/*" --resource-group "prod-*"
+
+# Use CI-friendly exit codes: 0=clean, 1=findings, 2=errors
+DudeWheresMyLogs -a --ci
 ```
 
 ### Options
@@ -67,9 +77,13 @@ DudeWheresMyLogs -w 20
 |------|-------------|
 | `-s`, `--subscription` | Subscription ID to scan (repeatable) |
 | `-a`, `--all` | Scan all accessible subscriptions |
-| `-f`, `--format` | Output format: `html` (default) or `csv` |
+| `-f`, `--format` | Output format: `html` (default), `csv`, or `json` |
 | `-o`, `--output` | Output file path (auto-generated if omitted) |
 | `-w`, `--workers` | Number of parallel workers (default: 10) |
+| `--include-types` | Only scan matching resource types (supports wildcards, repeatable) |
+| `--exclude-types` | Skip matching resource types (supports wildcards, repeatable) |
+| `--resource-group` | Only scan matching resource groups (supports wildcards, repeatable) |
+| `--ci` | Return `0` for clean, `1` for findings, `2` for scan errors |
 | `--version` | Show version and exit |
 
 ### Tips for large environments
@@ -78,8 +92,9 @@ DudeWheresMyLogs -w 20
 - Subscriptions are scanned sequentially, which naturally spreads API load across subscription-level throttle buckets.
 
 ## Output
-- **HTML report** (default): Self-contained file with summary cards, collapsible sections grouped by subscription and resource type (Missing, Duplicate, Healthy, Not Supported/Errors), per-resource diagnostic detail, and a destination map showing all resources streaming to each destination.
+- **HTML report** (default): Self-contained file with a findings overview, scope block, and five numbered sections (Missing Diagnostics, Duplicate Shipping, Healthy Resources, Informational, Destination Map). Findings are grouped by subscription and resource group; each resource expands inline to show its full ID, configured destinations, and log categories. Sections have stable anchor IDs (`#missing`, `#duplicate`, `#healthy`, `#informational`, `#destinations`) for sharing direct links.
 - **CSV report** (`-f csv`): Flat export with subscription, resource, status, destination, and duplicate flag columns.
+- **JSON report** (`-f json`): Structured export with summary metadata and full per-resource detail for automation and comparisons.
 
 ## License
 MIT

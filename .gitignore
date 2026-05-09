@@ -6,3 +6,9 @@ __pycache__/
 dist/
 build/
 .venv/
+
+# Generated reports (contain real subscription/resource data)
+dwml_report.*
+DudeWheresMyLogs_*.html
+DudeWheresMyLogs_*.csv
+DudeWheresMyLogs_*.json

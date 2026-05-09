@@ -1,8 +1,22 @@
 import sys
 
-from azure.identity import DefaultAzureCredential
-from azure.mgmt.resource import ResourceManagementClient
-from azure.mgmt.subscription import SubscriptionClient
+try:
+    from azure.identity import DefaultAzureCredential
+    from azure.mgmt.resource import ResourceManagementClient
+    from azure.mgmt.subscription import SubscriptionClient
+except ModuleNotFoundError:  # pragma: no cover - keeps unit tests importable without Azure SDK
+    DefaultAzureCredential = None
+    ResourceManagementClient = None
+    SubscriptionClient = None
+
+
+def _resource_group_from_id(resource_id):
+    """Extract the resource group name from an Azure resource ID."""
+    parts = resource_id.split("/")
+    for i, part in enumerate(parts):
+        if part.lower() == "resourcegroups" and i + 1 < len(parts):
+            return parts[i + 1]
+    return ""
 
 
 def _retry_policy_kwargs():
@@ -23,6 +37,11 @@ def _retry_policy_kwargs():
 
 def get_credential():
     """Authenticate using DefaultAzureCredential with eager validation."""
+    if DefaultAzureCredential is None:
+        print("Authentication failed: Azure SDK dependencies are not installed.")
+        print("Install the project requirements or run inside the configured virtual environment.")
+        sys.exit(1)
+
     try:
         credential = DefaultAzureCredential()
         # Force a token fetch to validate credentials early
@@ -37,6 +56,9 @@ def get_credential():
 
 def list_subscriptions(credential):
     """List all accessible Azure subscriptions."""
+    if SubscriptionClient is None:
+        raise RuntimeError("azure-mgmt-subscription is required to list subscriptions")
+
     client = SubscriptionClient(credential, **_retry_policy_kwargs())
     subscriptions = []
     for sub in client.subscriptions.list():
@@ -49,6 +71,9 @@ def list_subscriptions(credential):
 
 def list_resources(credential, subscription_id):
     """List all resources in a subscription."""
+    if ResourceManagementClient is None:
+        raise RuntimeError("azure-mgmt-resource is required to list resources")
+
     client = ResourceManagementClient(credential, subscription_id,
                                       **_retry_policy_kwargs())
     resources = []
@@ -58,5 +83,6 @@ def list_resources(credential, subscription_id):
             "name": resource.name,
             "type": resource.type,
             "location": resource.location,
+            "resource_group": _resource_group_from_id(resource.id),
         })
     return resources

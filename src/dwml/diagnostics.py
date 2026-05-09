@@ -3,8 +3,14 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
-from azure.mgmt.monitor import MonitorManagementClient
-from azure.core.exceptions import HttpResponseError
+try:
+    from azure.core.exceptions import HttpResponseError
+    from azure.mgmt.monitor import MonitorManagementClient
+except ModuleNotFoundError:  # pragma: no cover - keeps unit tests importable without Azure SDK
+    class HttpResponseError(Exception):
+        """Fallback exception used when Azure SDK is unavailable."""
+
+    MonitorManagementClient = None
 
 from .azure import _retry_policy_kwargs
 
@@ -40,6 +46,9 @@ _thread_local = threading.local()
 
 def _get_monitor_client(credential, subscription_id):
     """Get or create a thread-local MonitorManagementClient."""
+    if MonitorManagementClient is None:
+        raise RuntimeError("azure-mgmt-monitor is required to scan diagnostic settings")
+
     key = f"monitor_{subscription_id}"
     if not hasattr(_thread_local, key):
         setattr(_thread_local, key, MonitorManagementClient(credential, subscription_id,
