@@ -156,7 +156,8 @@ def filter_resources(resources, include_types=None, exclude_types=None, resource
     return filtered
 
 
-def _determine_exit_code(results, ci_mode=False, fail_on=None, ws_results=None):
+def _determine_exit_code(results, ci_mode=False, fail_on=None, ws_results=None,
+                         sub_audits=None):
     """Return the appropriate process exit code for the scan results.
 
     fail_on is an iterable of check names controlling what counts as a
@@ -169,11 +170,15 @@ def _determine_exit_code(results, ci_mode=False, fail_on=None, ws_results=None):
     if has_errors:
         return 2
 
+    pools = {
+        "resource": results,
+        "workspace": ws_results or [],
+        "subscription": sub_audits or [],
+    }
     categories = DEFAULT_FAIL_ON if fail_on is None else fail_on
     for category in categories:
         check = get_check(category)
-        pool = results if check.scope == "resource" else (ws_results or [])
-        if any(check.detect(item) for item in pool):
+        if any(check.detect(item) for item in pools[check.scope]):
             return 1
     return 0
 
@@ -285,9 +290,15 @@ def run(argv=None):
 
     # Scan each subscription
     all_results = []
+    sub_audits = []
+    audit_activity_log = "no-activity-log-export" in active_checks
 
     for sub in selected:
         print(f"Scanning subscription: {sub['name']} ({sub['id']})")
+
+        if audit_activity_log:
+            from .tenant import audit_subscription
+            sub_audits.append(audit_subscription(credential, sub["id"], sub["name"]))
 
         sys.stderr.write("Enumerating resources... ")
         sys.stderr.flush()
@@ -313,7 +324,7 @@ def run(argv=None):
         all_results.extend(results)
         print()
 
-    if not all_results:
+    if not all_results and not sub_audits:
         print("No results to report.")
         return 0
 
@@ -345,6 +356,9 @@ def run(argv=None):
     for check in get_checks(active_checks, scope="workspace"):
         count = sum(1 for ws in ws_results if check.detect(ws))
         print(f"  {check.title + ':':<24}{count}")
+    for check in get_checks(active_checks, scope="subscription"):
+        count = sum(1 for s in sub_audits if check.detect(s))
+        print(f"  {check.title + ':':<24}{count}")
     print(f"  {'Not Supported:':<24}{status_counts.get('Not Supported', 0)}")
     print(f"  {'Errors:':<24}{status_counts.get('Error', 0)}")
 
@@ -352,11 +366,11 @@ def run(argv=None):
     output_path = generate_report(
         all_results, fmt=args.format, output=args.output,
         summary_only=args.summary_only, checks=active_checks,
-        ws_results=ws_results,
+        ws_results=ws_results, sub_audits=sub_audits,
     )
     print(f"\nReport saved to: {output_path}")
     return _determine_exit_code(all_results, ci_mode=args.ci, fail_on=fail_on,
-                                ws_results=ws_results)
+                                ws_results=ws_results, sub_audits=sub_audits)
 
 
 def main():

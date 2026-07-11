@@ -11,7 +11,7 @@ from .workspaces import workspace_status
 
 
 def generate_report(results, fmt="html", output=None, summary_only=False, checks=None,
-                    ws_results=None):
+                    ws_results=None, sub_audits=None):
     """Generate a report in the specified format.
 
     Args:
@@ -24,6 +24,8 @@ def generate_report(results, fmt="html", output=None, summary_only=False, checks
             finding sections appear in HTML/Markdown reports
         ws_results: list of WorkspaceUsage from workspace analysis (None if
             workspace checks were not run)
+        sub_audits: list of SubscriptionAudit from the activity log check
+            (None if not run)
 
     Returns:
         The output file path.
@@ -37,19 +39,21 @@ def generate_report(results, fmt="html", output=None, summary_only=False, checks
     if fmt == "json":
         if output is None:
             output = f"DudeWheresMyLogs_{timestamp}.json"
-        return generate_json(results, output, ws_results=ws_results)
+        return generate_json(results, output, ws_results=ws_results,
+                             sub_audits=sub_audits)
     if fmt == "md":
         if output is None:
             output = f"DudeWheresMyLogs_{timestamp}.md"
         return generate_markdown(results, output, summary_only=summary_only,
-                                 checks=checks, ws_results=ws_results)
+                                 checks=checks, ws_results=ws_results,
+                                 sub_audits=sub_audits)
     if output is None:
         output = f"DudeWheresMyLogs_{timestamp}.html"
     return generate_html(results, output, summary_only=summary_only, checks=checks,
-                         ws_results=ws_results)
+                         ws_results=ws_results, sub_audits=sub_audits)
 
 
-def build_payload(results, ws_results=None):
+def build_payload(results, ws_results=None, sub_audits=None):
     """Build the machine-readable report payload (shared by JSON and HTML)."""
     status_counts = Counter(r.status for r in results)
     payload = {
@@ -72,6 +76,10 @@ def build_payload(results, ws_results=None):
             key = check.name.replace("-", "_") + "_count"
             payload["summary"][key] = sum(1 for ws in ws_results if check.detect(ws))
         payload["workspaces"] = [asdict(ws) for ws in ws_results]
+    if sub_audits is not None:
+        payload["summary"]["no_activity_log_export_count"] = sum(
+            1 for s in sub_audits if s.exported is False)
+        payload["subscription_audits"] = [asdict(s) for s in sub_audits]
     return payload
 
 
@@ -130,9 +138,9 @@ def generate_csv(results, output):
     return output
 
 
-def generate_json(results, output, ws_results=None):
+def generate_json(results, output, ws_results=None, sub_audits=None):
     """Write results to a machine-readable JSON report."""
-    payload = build_payload(results, ws_results=ws_results)
+    payload = build_payload(results, ws_results=ws_results, sub_audits=sub_audits)
 
     with open(output, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -162,12 +170,14 @@ def _dest_inline(r, dest_filter=None):
     return "; ".join(parts)
 
 
-def generate_markdown(results, output, summary_only=False, checks=None, ws_results=None):
+def generate_markdown(results, output, summary_only=False, checks=None, ws_results=None,
+                      sub_audits=None):
     """Write results to a findings-focused Markdown report.
 
     Healthy and informational resources are summarized as counts only;
     each active check gets a per-resource findings table unless summary_only
-    is set. Workspace usage (when analyzed) gets its own table.
+    is set. Workspace usage and subscription audits (when analyzed) get
+    their own tables.
     """
     status_counts = Counter(r.status for r in results)
     subs = sorted({r.subscription_name for r in results}, key=str.lower)
@@ -175,7 +185,9 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
 
     active_checks = get_checks(checks, scope="resource")
     ws_checks = get_checks(checks, scope="workspace")
+    sub_checks = get_checks(checks, scope="subscription")
     ws_results = ws_results or []
+    sub_audits = sub_audits or []
     findings = {c.name: [r for r in results if c.detect(r)] for c in active_checks}
     healthy_count = sum(1 for r in results if is_healthy(r, checks))
 
@@ -194,6 +206,8 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
         lines.append(f"| {c.title} | {len(findings[c.name])} |")
     for c in ws_checks:
         lines.append(f"| {c.title} | {sum(1 for ws in ws_results if c.detect(ws))} |")
+    for c in sub_checks:
+        lines.append(f"| {c.title} | {sum(1 for s in sub_audits if c.detect(s))} |")
     lines.extend([
         f"| Healthy | {healthy_count} |",
         f"| Not supported | {status_counts.get('Not Supported', 0)} |",
@@ -238,6 +252,21 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
         for c in active_checks:
             _table(c.title, findings[c.name],
                    dest_col=c.dest_label or None, dest_filter=c.dest_filter)
+
+    if sub_checks and sub_audits:
+        lines.append(f"## Activity Log Export ({len(sub_audits)} subscription(s))")
+        lines.append("")
+        lines.append("| Subscription | Exported | Destinations | Categories | Missing Core |")
+        lines.append("|---|---|---|---|---|")
+        for s in sub_audits:
+            exported = "?" if s.exported is None else ("Yes" if s.exported else "NO")
+            dests = "; ".join(f"{d['type']}: {d['name']}" for d in s.destinations) or "-"
+            lines.append(
+                f"| {_md_escape(s.subscription_name)} | {exported} "
+                f"| {_md_escape(dests)} | {_md_escape(', '.join(s.categories) or '-')} "
+                f"| {_md_escape(', '.join(s.missing_core) or '-')} |"
+            )
+        lines.append("")
 
     if ws_checks and ws_results:
         lines.append(f"## Workspace Usage ({len(ws_results)})")
@@ -766,7 +795,8 @@ body {
 """
 
 
-def generate_html(results, output, summary_only=False, checks=None, ws_results=None):
+def generate_html(results, output, summary_only=False, checks=None, ws_results=None,
+                  sub_audits=None):
     """Write results to a self-contained HTML report."""
     e = html.escape
     status_counts = Counter(r.status for r in results)
@@ -777,7 +807,9 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
 
     active_checks = get_checks(checks, scope="resource")
     ws_checks = get_checks(checks, scope="workspace")
+    sub_checks = get_checks(checks, scope="subscription")
     ws_results = ws_results or []
+    sub_audits = sub_audits or []
     findings = {c.name: [r for r in results if c.detect(r)] for c in active_checks}
     healthy_count = sum(1 for r in results if is_healthy(r, checks))
 
@@ -1092,6 +1124,12 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
             f'<tr><td><a href="#{c.anchor}">{e(c.title)}</a></td>'
             f"{_fmt_count(ws_count, c.severity)}</tr>"
         )
+    for c in sub_checks:
+        sub_count = sum(1 for s in sub_audits if c.detect(s))
+        overview_parts.append(
+            f'<tr><td><a href="#{c.anchor}">{e(c.title)}</a></td>'
+            f"{_fmt_count(sub_count, c.severity)}</tr>"
+        )
     overview_parts.append(
         f'<tr><td><a href="#healthy">Healthy</a></td>{_fmt_count(healthy_count, "ok")}</tr>'
         f'<tr><td><a href="#informational">Not supported</a></td>{_fmt_count(notsup_count)}</tr>'
@@ -1123,6 +1161,51 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
         anchor="informational", omit_details=summary_only,
     ))
     num += 2
+
+    if sub_checks and sub_audits:
+        num += 1
+        flagged_subs = sum(1 for s in sub_audits if s.exported is False)
+        sub_rows = []
+        for s in sub_audits:
+            if s.exported is None:
+                exported_html = f'<span class="dim">unknown{": " + e(s.error) if s.error else ""}</span>'
+            elif s.exported:
+                exported_html = "Yes"
+            else:
+                exported_html = '<span class="t-error">NO</span>'
+            dests = "; ".join(
+                f"{e(d['type'])}: {e(d['name'])}" for d in s.destinations) or "&mdash;"
+            sub_rows.append(
+                "<tr>"
+                f'<td class="name-cell">{e(s.subscription_name)}</td>'
+                f'<td class="id-cell">{e(s.subscription_id)}</td>'
+                f"<td>{exported_html}</td>"
+                f"<td>{dests}</td>"
+                f"<td>{e(', '.join(s.categories)) or '&mdash;'}</td>"
+                f"<td>{e(', '.join(s.missing_core)) or '&mdash;'}</td>"
+                "</tr>"
+            )
+        sub_table = (
+            '<table class="settings">'
+            "<thead><tr>"
+            "<th>Subscription</th><th>ID</th><th>Exported</th>"
+            "<th>Destinations</th><th>Categories</th><th>Missing Core</th>"
+            "</tr></thead><tbody>" + "".join(sub_rows) + "</tbody></table>"
+        )
+        severity_class = " flag-err" if flagged_subs else ""
+        open_attr = " open" if flagged_subs else ""
+        sections.append(
+            '<div class="section-wrap">'
+            '<a class="anchor" href="#activity-log" aria-label="link to Activity Log Export">#</a>'
+            f'<details class="section{severity_class}"{open_attr} id="activity-log">'
+            '<summary class="sec-summary">'
+            f'<span class="sec-num">{num}.</span>'
+            '<span class="sec-title">Activity Log Export</span>'
+            f'<span class="sec-count">{flagged_subs} of {len(sub_audits)} not exported</span>'
+            "</summary>"
+            f'<div class="sec-body">{sub_table}</div>'
+            "</details></div>"
+        )
 
     if ws_checks:
         num += 1
@@ -1197,7 +1280,8 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
     # re-parsed or diffed without re-scanning. "</" is escaped so result
     # content can never terminate the script block early.
     embedded_json = json.dumps(
-        build_payload(results, ws_results=ws_results if ws_checks else None),
+        build_payload(results, ws_results=ws_results if ws_checks else None,
+                      sub_audits=sub_audits if sub_checks else None),
         sort_keys=True,
     ).replace("</", "<\\/")
 

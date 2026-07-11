@@ -121,6 +121,20 @@ CHECKS = (
         anchor="workspace-usage",
         scope="workspace",
     ),
+    Check(
+        name="no-activity-log-export",
+        title="No Activity Log Export",
+        description="Subscriptions whose Activity Log (control-plane audit trail) is "
+                    "not exported anywhere; Azure keeps it only 90 days, and export "
+                    "to Log Analytics is free",
+        detect=lambda s: s.exported is False,
+        default_fail_on=True,
+        severity="err",
+        row_kind="duplicate",
+        default_open=True,
+        anchor="activity-log",
+        scope="subscription",
+    ),
 )
 
 CHECK_NAMES = tuple(c.name for c in CHECKS)

@@ -340,6 +340,72 @@ class SilentResourceTests(unittest.TestCase):
         self.assertFalse(r.destinations[0]["silent"])
 
 
+class ActivityLogExportTests(unittest.TestCase):
+    def _sub_setting(self, workspace_id=None, categories=("Administrative",), enabled=True):
+        return SimpleNamespace(
+            workspace_id=workspace_id, storage_account_id=None,
+            event_hub_authorization_rule_id=None, event_hub_name=None,
+            marketplace_partner_id=None,
+            logs=[SimpleNamespace(category=c, enabled=enabled) for c in categories],
+        )
+
+    def test_exported_detection(self):
+        from dwml.tenant import audit_from_settings
+        exported = audit_from_settings("sub-1", "Sub", [
+            self._sub_setting(workspace_id=WORKSPACE_A,
+                              categories=("Administrative", "Security", "Policy"))])
+        self.assertTrue(exported.exported)
+        self.assertEqual(exported.missing_core, [])
+        self.assertEqual(exported.destinations[0]["type"], "Log Analytics")
+
+        not_exported = audit_from_settings("sub-1", "Sub", [])
+        self.assertFalse(not_exported.exported)
+        self.assertEqual(not_exported.missing_core,
+                         ["Administrative", "Security", "Policy"])
+
+        # A setting with categories but no destination does not count
+        no_dest = audit_from_settings("sub-1", "Sub", [self._sub_setting()])
+        self.assertFalse(no_dest.exported)
+
+        # Disabled categories do not count
+        disabled = audit_from_settings("sub-1", "Sub", [
+            self._sub_setting(workspace_id=WORKSPACE_A, enabled=False)])
+        self.assertFalse(disabled.exported)
+
+    def test_check_detection_and_exit_code(self):
+        from dwml.tenant import SubscriptionAudit
+        check = get_check("no-activity-log-export")
+        bad = SubscriptionAudit("sub-1", "Sub", exported=False)
+        good = SubscriptionAudit("sub-1", "Sub", exported=True)
+        unknown = SubscriptionAudit("sub-1", "Sub", exported=None, error="denied")
+        self.assertTrue(check.detect(bad))
+        self.assertFalse(check.detect(good))
+        self.assertFalse(check.detect(unknown))
+        # Fails CI by default (it is a missing-logging finding)
+        self.assertEqual(_determine_exit_code([], ci_mode=True, sub_audits=[bad]), 1)
+        self.assertEqual(_determine_exit_code([], ci_mode=True, sub_audits=[good]), 0)
+
+    def test_reports_render_activity_log_section(self):
+        from dwml.tenant import SubscriptionAudit
+        audits = [SubscriptionAudit("sub-1", "Sub One", exported=False,
+                                    missing_core=["Administrative", "Security", "Policy"])]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            html_out = Path(tmp_dir) / "r.html"
+            md_out = Path(tmp_dir) / "r.md"
+            json_out = Path(tmp_dir) / "r.json"
+            generate_html([_result()], str(html_out), sub_audits=audits)
+            generate_markdown([_result()], str(md_out), sub_audits=audits)
+            generate_json([_result()], str(json_out), sub_audits=audits)
+            html_content = html_out.read_text(encoding="utf-8")
+            md_content = md_out.read_text(encoding="utf-8")
+            payload = json.loads(json_out.read_text(encoding="utf-8"))
+
+        self.assertIn("Activity Log Export", html_content)
+        self.assertIn("1 of 1 not exported", html_content)
+        self.assertIn("## Activity Log Export", md_content)
+        self.assertEqual(payload["summary"]["no_activity_log_export_count"], 1)
+
+
 class ReportingTests(unittest.TestCase):
     def _results(self):
         return [
