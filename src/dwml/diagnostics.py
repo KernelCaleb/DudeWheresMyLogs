@@ -4,24 +4,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 try:
-    from azure.core.exceptions import HttpResponseError
+    from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
     from azure.mgmt.monitor import MonitorManagementClient
 except ModuleNotFoundError:  # pragma: no cover - keeps unit tests importable without Azure SDK
     class HttpResponseError(Exception):
         """Fallback exception used when Azure SDK is unavailable."""
 
+    class ResourceNotFoundError(HttpResponseError):
+        """Fallback exception used when Azure SDK is unavailable."""
+
     MonitorManagementClient = None
 
-from .azure import _retry_policy_kwargs
-
-
-def _resource_group_from_id(resource_id):
-    """Extract the resource group name from an Azure resource ID."""
-    parts = resource_id.split("/")
-    for i, part in enumerate(parts):
-        if part.lower() == "resourcegroups" and i + 1 < len(parts):
-            return parts[i + 1]
-    return ""
+from .azure import _resource_group_from_id, _retry_policy_kwargs
 
 
 @dataclass
@@ -38,6 +32,16 @@ class DiagnosticResult:
     destinations: list = field(default_factory=list)
     duplicate: bool = False
     error_message: str = ""
+
+
+def has_dead_destination(result):
+    """True if any destination of this result no longer exists in Azure."""
+    return any(d.get("not_found") for d in result.destinations)
+
+
+def has_cross_region(result):
+    """True if any destination of this result lives in a different region."""
+    return any(d.get("cross_region") for d in result.destinations)
 
 
 # Thread-local storage for MonitorManagementClient instances
@@ -117,8 +121,11 @@ def _extract_destinations(settings_list):
 
     Returns (destinations, is_duplicate) where destinations is a list of dicts
     and is_duplicate is True if the same destination type (e.g. Log Analytics)
-    appears across multiple settings -- meaning logs are being shipped to
-    multiple places and the org is paying for it more than once.
+    appears with two or more *different* destination IDs -- meaning logs are
+    being shipped to multiple places of the same kind and the org is paying
+    for it more than once.  Multiple settings pointing at the *same*
+    destination are not flagged: Azure deduplicates those at the platform
+    level, and splitting categories across settings is a legitimate pattern.
 
     Each destination dict contains:
         setting_name: name of the diagnostic setting
@@ -129,7 +136,7 @@ def _extract_destinations(settings_list):
         la_destination_type: "Dedicated" or "AzureDiagnostics" (Log Analytics only)
     """
     destinations = []
-    type_counts = {}
+    ids_by_type = {}
 
     for setting in settings_list:
         setting_name = setting.name or ""
@@ -137,7 +144,7 @@ def _extract_destinations(settings_list):
         la_dest_type = getattr(setting, "log_analytics_destination_type", None) or ""
 
         if setting.workspace_id:
-            type_counts["Log Analytics"] = type_counts.get("Log Analytics", 0) + 1
+            ids_by_type.setdefault("Log Analytics", set()).add(setting.workspace_id.lower())
             destinations.append({
                 "setting_name": setting_name,
                 "type": "Log Analytics",
@@ -148,7 +155,7 @@ def _extract_destinations(settings_list):
             })
 
         if setting.storage_account_id:
-            type_counts["Storage Account"] = type_counts.get("Storage Account", 0) + 1
+            ids_by_type.setdefault("Storage Account", set()).add(setting.storage_account_id.lower())
             destinations.append({
                 "setting_name": setting_name,
                 "type": "Storage Account",
@@ -160,7 +167,7 @@ def _extract_destinations(settings_list):
 
         if setting.event_hub_authorization_rule_id or setting.event_hub_name:
             eh_id = setting.event_hub_authorization_rule_id or setting.event_hub_name
-            type_counts["Event Hub"] = type_counts.get("Event Hub", 0) + 1
+            ids_by_type.setdefault("Event Hub", set()).add(eh_id.lower())
             destinations.append({
                 "setting_name": setting_name,
                 "type": "Event Hub",
@@ -171,7 +178,7 @@ def _extract_destinations(settings_list):
             })
 
         if setting.marketplace_partner_id:
-            type_counts["Partner Solution"] = type_counts.get("Partner Solution", 0) + 1
+            ids_by_type.setdefault("Partner Solution", set()).add(setting.marketplace_partner_id.lower())
             destinations.append({
                 "setting_name": setting_name,
                 "type": "Partner Solution",
@@ -181,7 +188,7 @@ def _extract_destinations(settings_list):
                 "la_destination_type": "",
             })
 
-    duplicate = any(count > 1 for count in type_counts.values())
+    duplicate = any(len(ids) > 1 for ids in ids_by_type.values())
 
     return destinations, duplicate
 
@@ -272,12 +279,59 @@ def _check_single_resource(credential, resource, subscription_id, subscription_n
     return results
 
 
-def _resolve_destination_regions(credential, results):
+def _norm_region(value):
+    """Normalize an Azure region name for comparison ('East US' -> 'eastus')."""
+    return (value or "").replace(" ", "").lower()
+
+
+# Used only when provider metadata lookup fails; valid for Microsoft.Resources
+# but typically rejected by other providers, in which case region stays "".
+_FALLBACK_API_VERSION = "2021-04-01"
+
+
+def _provider_type_from_id(resource_id):
+    """Parse (namespace, resource_type) from a resource ID.
+
+    e.g. .../providers/Microsoft.EventHub/namespaces/ns1/authorizationRules/r1
+    -> ("Microsoft.EventHub", "namespaces/authorizationRules")
+    """
+    parts = [p for p in resource_id.split("/") if p]
+    idx = next((i for i, p in enumerate(parts) if p.lower() == "providers"), None)
+    if idx is None or idx + 2 >= len(parts):
+        return "", ""
+    namespace = parts[idx + 1]
+    type_segments = parts[idx + 2::2]
+    return namespace, "/".join(type_segments)
+
+
+def _lookup_api_version(client, namespace, resource_type):
+    """Find a usable API version for a resource type via provider metadata.
+
+    get_by_id requires an API version valid for the *destination's* provider,
+    not ARM's own. Prefers the newest stable version.
+    """
+    try:
+        provider = client.providers.get(namespace)
+        for rt in provider.resource_types or []:
+            if (rt.resource_type or "").lower() == resource_type.lower():
+                versions = rt.api_versions or []
+                stable = [v for v in versions if "preview" not in v.lower()]
+                if stable or versions:
+                    return (stable or versions)[0]
+    except Exception:
+        pass
+    return _FALLBACK_API_VERSION
+
+
+def _resolve_destination_regions(credential, results, max_workers=10):
     """Resolve the region/location for each unique destination resource.
 
     Collects all unique destination resource IDs, groups by subscription,
-    and uses the ResourceManagementClient to look up each resource's location.
-    Updates destination dicts in-place with a 'region' key.
+    and uses the ResourceManagementClient to look up each resource's location
+    in parallel.  Updates destination dicts in-place with:
+        region: the destination resource's region ("" if unresolvable)
+        not_found: True if the destination no longer exists (404) --
+                   the diagnostic setting is shipping logs to a dead end
     """
     from azure.mgmt.resource import ResourceManagementClient
 
@@ -295,31 +349,73 @@ def _resolve_destination_regions(credential, results):
     if not dest_ids_by_sub:
         return
 
-    # Resolve each destination resource
+    # Resolve each destination resource in parallel
     resolved = {}
-    for sub_id, dest_ids in dest_ids_by_sub.items():
+    lock = threading.Lock()
+
+    def _resolve(client, did, api_version):
         try:
-            client = ResourceManagementClient(credential, sub_id,
-                                              **_retry_policy_kwargs())
+            resource = client.resources.get_by_id(did, api_version=api_version)
+            info = {"region": getattr(resource, "location", "") or "",
+                    "not_found": False}
+        except ResourceNotFoundError:
+            # Destination was deleted but the diagnostic setting still points at it
+            info = {"region": "", "not_found": True}
         except Exception:
-            continue
+            # No access, unusable API version, etc. -- unknown, don't flag
+            info = {"region": "", "not_found": False}
+        with lock:
+            resolved[did] = info
 
-        for did in dest_ids:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for sub_id, dest_ids in dest_ids_by_sub.items():
             try:
-                resource = client.resources.get_by_id(did, api_version="2021-04-01")
-                resolved[did] = getattr(resource, "location", "") or ""
+                client = ResourceManagementClient(credential, sub_id,
+                                                  **_retry_policy_kwargs())
             except Exception:
-                resolved[did] = ""
+                continue
 
-    # Write resolved regions back into destination dicts
+            # Resolve API versions serially first: one provider-metadata call
+            # per unique resource type, shared by all lookups in this sub
+            api_versions = {}
+            for did in dest_ids:
+                namespace, resource_type = _provider_type_from_id(did)
+                key = (namespace.lower(), resource_type.lower())
+                if key not in api_versions:
+                    api_versions[key] = _lookup_api_version(
+                        client, namespace, resource_type)
+
+            for did in dest_ids:
+                namespace, resource_type = _provider_type_from_id(did)
+                api_version = api_versions[(namespace.lower(), resource_type.lower())]
+                executor.submit(_resolve, client, did, api_version)
+
+    # Write resolved info back into destination dicts
     for r in results:
         for d in r.destinations:
-            d["region"] = resolved.get(d.get("id", ""), "")
+            info = resolved.get(d.get("id", ""), {"region": "", "not_found": False})
+            d["region"] = info["region"]
+            d["not_found"] = info["not_found"]
 
     total = len(resolved)
     if total:
         sys.stderr.write(f"Resolved regions for {total} destination resources\n")
         sys.stderr.flush()
+
+
+def _flag_cross_region(results):
+    """Mark destinations whose region differs from the source resource's region.
+
+    Skips resources in the 'global' pseudo-region and destinations whose
+    region could not be resolved.
+    """
+    for r in results:
+        src = _norm_region(r.resource_location)
+        for d in r.destinations:
+            dest = _norm_region(d.get("region", ""))
+            d["cross_region"] = bool(
+                src and dest and src != "global" and dest != src
+            )
 
 
 def check_all_diagnostics(credential, subscription_id, subscription_name, resources,
@@ -376,9 +472,10 @@ def check_all_diagnostics(credential, subscription_id, subscription_name, resour
     sys.stderr.write("\r" + " " * 80 + "\r")
     sys.stderr.flush()
 
-    # Resolve destination resource regions
+    # Resolve destination resource regions and derive findings from them
     sys.stderr.write("Resolving destination resource regions...\n")
     sys.stderr.flush()
-    _resolve_destination_regions(credential, all_results)
+    _resolve_destination_regions(credential, all_results, max_workers=max_workers)
+    _flag_cross_region(all_results)
 
     return all_results

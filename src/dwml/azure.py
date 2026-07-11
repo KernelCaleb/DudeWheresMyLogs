@@ -55,17 +55,29 @@ def get_credential():
 
 
 def list_subscriptions(credential):
-    """List all accessible Azure subscriptions."""
+    """List accessible Azure subscriptions in the Enabled state.
+
+    Disabled/warned/expired subscriptions are skipped -- scanning them only
+    produces errors.  A note is written to stderr when any are skipped.
+    """
     if SubscriptionClient is None:
         raise RuntimeError("azure-mgmt-subscription is required to list subscriptions")
 
     client = SubscriptionClient(credential, **_retry_policy_kwargs())
     subscriptions = []
+    skipped = 0
     for sub in client.subscriptions.list():
+        state = str(getattr(sub, "state", "") or "")
+        if state and state.lower() != "enabled":
+            skipped += 1
+            continue
         subscriptions.append({
             "id": sub.subscription_id,
             "name": sub.display_name,
         })
+    if skipped:
+        sys.stderr.write(f"Skipped {skipped} subscription(s) not in the Enabled state.\n")
+        sys.stderr.flush()
     return subscriptions
 
 

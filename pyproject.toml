@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "DudeWheresMyLogs"
-version = "2.0.0"
+version = "2.2.0"
 description = "Azure diagnostic logging auditor - find missing logs, duplicate log shipping, and wasted spend"
 requires-python = ">=3.9"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
     "azure-mgmt-subscription",
     "azure-mgmt-monitor>=6.0.0,<7.0.0",
     "azure-mgmt-loganalytics",
+    "azure-monitor-query",
 ]
 readme = "README.md"
 license = "MIT"
@@ -33,3 +34,7 @@ DudeWheresMyLogs = "dwml.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
