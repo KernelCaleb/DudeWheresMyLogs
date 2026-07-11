@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import datetime
 
 from .checks import get_checks, is_healthy
+from .costs import export_fee_destinations, fmt_usd
 from .diagnostics import has_cross_region, has_dead_destination
 from .workspaces import workspace_status
 
@@ -76,6 +77,15 @@ def build_payload(results, ws_results=None, sub_audits=None):
             key = check.name.replace("-", "_") + "_count"
             payload["summary"][key] = sum(1 for ws in ws_results if check.detect(ws))
         payload["workspaces"] = [asdict(ws) for ws in ws_results]
+        spend = [ws.est_monthly_total for ws in ws_results
+                 if ws.est_monthly_total is not None]
+        waste = [r.est_monthly_impact for r in results
+                 if r.est_monthly_impact is not None]
+        if spend or waste:
+            payload["summary"]["est_monthly_spend_usd"] = round(sum(spend), 2)
+            payload["summary"]["est_monthly_waste_usd"] = round(sum(waste), 2)
+        payload["summary"]["export_fee_destination_count"] = len(
+            export_fee_destinations(results))
     if sub_audits is not None:
         payload["summary"]["no_activity_log_export_count"] = sum(
             1 for s in sub_audits if s.exported is False)
@@ -228,10 +238,14 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
             lines.append("None.")
             lines.append("")
             return
+        show_impact = any(r.est_monthly_impact is not None for r in items)
         header = "| Subscription | Resource Group | Type | Name | Region |"
         divider = "|---|---|---|---|---|"
         if dest_col:
             header += f" {dest_col} |"
+            divider += "---|"
+        if show_impact:
+            header += " Est Waste/mo |"
             divider += "---|"
         lines.append(header)
         lines.append(divider)
@@ -245,6 +259,8 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
             )
             if dest_col:
                 row += f" {_md_escape(_dest_inline(r, dest_filter=dest_filter))} |"
+            if show_impact:
+                row += f" {fmt_usd(r.est_monthly_impact) if r.est_monthly_impact is not None else '-'} |"
             lines.append(row)
         lines.append("")
 
@@ -273,18 +289,25 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
         lines.append("")
         lookback = ws_results[0].lookback_days
         lines.append(f"| Workspace | Region | Resources Shipping | Sources Seen "
-                     f"| Retention | SKU | Ingest GB ({lookback}d) | Queries ({lookback}d) | Status |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+                     f"| Retention | SKU | Ingest GB ({lookback}d) | Queries ({lookback}d) "
+                     f"| Est $/mo | Status |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for ws in ws_results:
             ingest = "?" if ws.ingest_gb is None else f"{ws.ingest_gb:g}"
             queries = "?" if ws.query_count is None else str(ws.query_count)
             seen = "?" if ws.seen_resources is None else str(ws.seen_resources)
+            sku = ws.sku + (" +Sentinel" if ws.sentinel_enabled else "")
             lines.append(
                 f"| {_md_escape(ws.name)} | {_md_escape(ws.region)} "
                 f"| {ws.shipping_resources} | {seen} | {ws.retention_days}d "
-                f"| {_md_escape(ws.sku)} | {ingest} | {queries} "
+                f"| {_md_escape(sku)} | {ingest} | {queries} "
+                f"| {fmt_usd(ws.est_monthly_total)} "
                 f"| {_md_escape(workspace_status(ws))} |"
             )
+        lines.append("")
+        lines.append("Cost figures are list-price estimates "
+                     "(see --price-file); actual bills vary with region, "
+                     "discounts, and commitment tiers.")
         lines.append("")
 
     with open(output, "w", encoding="utf-8") as f:
@@ -930,6 +953,10 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
             cols_class = "row-cols-4"
 
         expand_parts = [f'<div class="full-id">{e(r.resource_id)}</div>']
+        if r.est_monthly_impact is not None:
+            expand_parts.append(
+                '<div class="empty-state">Estimated monthly waste: '
+                f"{e(fmt_usd(r.est_monthly_impact))} (list-price estimate)</div>")
         if r.error_message:
             expand_parts.append(f'<div class="err-msg">{e(r.error_message)}</div>')
         if r.destinations:
@@ -1135,6 +1162,22 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
         f'<tr><td><a href="#informational">Not supported</a></td>{_fmt_count(notsup_count)}</tr>'
         f'<tr><td><a href="#informational">Errors</a></td>{_fmt_count(error_count, "err")}</tr>'
     )
+    spend = [ws.est_monthly_total for ws in ws_results if ws.est_monthly_total is not None]
+    waste = [r.est_monthly_impact for r in results if r.est_monthly_impact is not None]
+    if spend:
+        overview_parts.append(
+            '<tr><td><a href="#workspace-usage">Est. monthly log spend</a></td>'
+            f'<td class="v">{e(fmt_usd(sum(spend)))}</td></tr>')
+    if waste:
+        overview_parts.append(
+            '<tr><td>Est. monthly waste (findings)</td>'
+            f'<td class="v f-dup">{e(fmt_usd(sum(waste)))}</td></tr>')
+    export_fee_count = len(export_fee_destinations(results))
+    if export_fee_count:
+        overview_parts.append(
+            '<tr><td><a href="#destinations">Destinations subject to platform '
+            "export fee</a></td>"
+            f'<td class="v f-warn">{export_fee_count}</td></tr>')
     overview_rows = "".join(overview_parts)
 
     sections = []
@@ -1233,6 +1276,9 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
                 ingest = "?" if ws.ingest_gb is None else f"{ws.ingest_gb:g}"
                 queries = "?" if ws.query_count is None else str(ws.query_count)
                 seen = "?" if ws.seen_resources is None else str(ws.seen_resources)
+                sku_html = e(ws.sku)
+                if ws.sentinel_enabled:
+                    sku_html += ' <span class="la-tag tag-warn">Sentinel</span>'
                 ws_rows.append(
                     "<tr>"
                     f'<td class="name-cell" title="{e(ws.workspace_id)}">{e(ws.name)}</td>'
@@ -1240,9 +1286,10 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
                     f"<td>{ws.shipping_resources}</td>"
                     f"<td>{seen}</td>"
                     f"<td>{ws.retention_days}d</td>"
-                    f"<td>{e(ws.sku)}</td>"
+                    f"<td>{sku_html}</td>"
                     f"<td>{ingest}</td>"
                     f"<td>{queries}</td>"
+                    f"<td>{e(fmt_usd(ws.est_monthly_total))}</td>"
                     f"<td>{status_html}</td>"
                     "</tr>"
                 )
@@ -1252,8 +1299,10 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
                 "<th>Workspace</th><th>Region</th><th>Resources</th>"
                 f"<th>Sources Seen</th>"
                 f"<th>Retention</th><th>SKU</th><th>Ingest GB ({lookback}d)</th>"
-                f"<th>Queries ({lookback}d)</th><th>Status</th>"
+                f"<th>Queries ({lookback}d)</th><th>Est $/mo</th><th>Status</th>"
                 "</tr></thead><tbody>" + "".join(ws_rows) + "</tbody></table>"
+                '<div class="empty-state">Cost figures are list-price estimates; '
+                "actual bills vary with region, discounts, and commitment tiers.</div>"
             )
             severity_class = " flag-warn" if flagged else ""
             open_attr = " open" if flagged else ""

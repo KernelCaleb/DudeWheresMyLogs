@@ -406,6 +406,81 @@ class ActivityLogExportTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["no_activity_log_export_count"], 1)
 
 
+class CostEstimateTests(unittest.TestCase):
+    def setUp(self):
+        from dwml.costs import load_prices
+        self.prices = load_prices()
+
+    def test_workspace_ingest_and_retention_math(self):
+        from dwml.costs import estimate_costs
+        ws = _workspace(audit=True, queries=1)
+        ws.ingest_gb = 30.0  # 30 GB over 30 days -> 30 GB/month
+        ws.ingest_gb_by_plan = {"analytics": 30.0, "basic": 0.0, "auxiliary": 0.0}
+        ws.sentinel_enabled = False
+        ws.retention_days = 121  # 90 days beyond the 31 free
+        estimate_costs([], [ws], {}, self.prices)
+        self.assertAlmostEqual(ws.est_monthly_ingest, 30.0 * 2.30, places=2)
+        # 1 GB/day * 90 extra days * $0.10/GB-month
+        self.assertAlmostEqual(ws.est_monthly_retention, 1.0 * 90 * 0.10, places=2)
+
+    def test_sentinel_rate_applies(self):
+        from dwml.costs import estimate_costs
+        ws = _workspace()
+        ws.ingest_gb = 30.0
+        ws.ingest_gb_by_plan = {"analytics": 30.0, "basic": 0.0, "auxiliary": 0.0}
+        ws.sentinel_enabled = True
+        ws.retention_days = 90  # within Sentinel free window
+        estimate_costs([], [ws], {}, self.prices)
+        self.assertAlmostEqual(ws.est_monthly_ingest, 30.0 * 4.30, places=2)
+        self.assertEqual(ws.est_monthly_retention, 0.0)
+
+    def test_duplicate_waste_keeps_largest_flow(self):
+        from dwml.costs import estimate_costs
+        ws_a = _workspace(name="law-a")
+        ws_b = _workspace(name="law-b")
+        for ws in (ws_a, ws_b):
+            ws.sentinel_enabled = False
+        r = _result(duplicate=True, destinations=[
+            {"type": "Log Analytics", "id": ws_a.workspace_id, "name": "law-a",
+             "region": "eastus", "not_found": False, "setting_name": "s",
+             "log_categories": [], "la_destination_type": ""},
+            {"type": "Log Analytics", "id": ws_b.workspace_id, "name": "law-b",
+             "region": "eastus", "not_found": False, "setting_name": "s",
+             "log_categories": [], "la_destination_type": ""},
+        ])
+        rid = r.resource_id.lower()
+        seen = {ws_a.workspace_id: {rid: 10.0}, ws_b.workspace_id: {rid: 3.0}}
+        estimate_costs([r], [ws_a, ws_b], seen, self.prices)
+        # Larger flow (10 GB) kept; 3 GB/30d redundant -> 3 GB/mo * $2.30
+        self.assertAlmostEqual(r.est_monthly_impact, 3.0 * 2.30, places=2)
+
+    def test_cross_region_bandwidth(self):
+        from dwml.costs import bandwidth_rate
+        self.assertEqual(bandwidth_rate("eastus", "westus2", self.prices), 0.02)
+        self.assertEqual(bandwidth_rate("eastus", "westeurope", self.prices), 0.05)
+        self.assertEqual(bandwidth_rate("japaneast", "eastus", self.prices), 0.08)
+        self.assertEqual(bandwidth_rate("brazilsouth", "eastus", self.prices), 0.16)
+
+    def test_no_data_no_estimate(self):
+        from dwml.costs import estimate_costs
+        ws = _workspace()
+        ws.ingest_gb = None
+        r = _result(duplicate=True, destinations=[
+            {"type": "Log Analytics", "id": ws.workspace_id, "name": "law",
+             "region": "eastus", "not_found": False, "setting_name": "s",
+             "log_categories": [], "la_destination_type": ""}])
+        estimate_costs([r], [ws], {}, self.prices)
+        self.assertIsNone(ws.est_monthly_total)
+        self.assertIsNone(r.est_monthly_impact)
+
+    def test_export_fee_destinations_counted(self):
+        from dwml.costs import export_fee_destinations
+        r = _result(destinations=[
+            {"type": "Storage Account", "id": STORAGE_A, "name": "stga"},
+            {"type": "Log Analytics", "id": WORKSPACE_A, "name": "law"}])
+        self.assertEqual(len(export_fee_destinations([r])), 1)
+
+
 class ReportingTests(unittest.TestCase):
     def _results(self):
         return [

@@ -109,6 +109,12 @@ def build_parser():
         help="Lookback window for workspace usage analysis (default: 30).",
     )
     parser.add_argument(
+        "--price-file",
+        metavar="FILE",
+        help="JSON price table overriding the built-in East US list prices "
+             "used for cost estimates.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
@@ -336,6 +342,7 @@ def run(argv=None):
         or "silent-resources" in active_checks
     )
     if needs_ws_analysis:
+        from .costs import estimate_costs, load_prices
         from .workspaces import analyze_workspaces, flag_silent_resources
         ws_results, seen_map = analyze_workspaces(
             credential, all_results,
@@ -343,6 +350,13 @@ def run(argv=None):
         )
         if "silent-resources" in active_checks:
             flag_silent_resources(all_results, seen_map)
+        try:
+            prices = load_prices(args.price_file)
+        except (OSError, ValueError) as e:
+            print(f"Warning: could not load price file: {e}; skipping cost estimates.")
+            prices = None
+        if prices:
+            estimate_costs(all_results, ws_results, seen_map, prices)
 
     # Print summary
     status_counts = Counter(r.status for r in all_results)
@@ -361,6 +375,16 @@ def run(argv=None):
         print(f"  {check.title + ':':<24}{count}")
     print(f"  {'Not Supported:':<24}{status_counts.get('Not Supported', 0)}")
     print(f"  {'Errors:':<24}{status_counts.get('Error', 0)}")
+
+    spend = [ws.est_monthly_total for ws in ws_results if ws.est_monthly_total is not None]
+    waste = [r.est_monthly_impact for r in all_results if r.est_monthly_impact is not None]
+    if spend or waste:
+        from .costs import fmt_usd
+        print(f"  {'Est. monthly spend:':<24}{fmt_usd(sum(spend))} "
+              f"across {len(spend)} workspace(s) (list-price estimate)")
+        if waste:
+            print(f"  {'Est. monthly waste:':<24}{fmt_usd(sum(waste))} "
+                  f"from {len(waste)} finding(s)")
 
     # Generate report
     output_path = generate_report(

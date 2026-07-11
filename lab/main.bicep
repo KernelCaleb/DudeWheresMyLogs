@@ -141,6 +141,14 @@ resource dupToSecondary 'Microsoft.Insights/diagnosticSettings@2021-05-01-previe
   properties: { workspaceId: lawSecondary.id, logs: kvAuditLogs }
 }
 
+// Storage destination on the duplicate vault: exercises the platform
+// export fee flag (Storage/Event Hub destinations, billed since June 2026)
+resource dupToStorage 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  scope: kvDup
+  name: 'ship-to-storage'
+  properties: { storageAccountId: stg.id, logs: kvAuditLogs }
+}
+
 // Dead destination (after seed.sh deletes lawDoomed)
 resource deadShip 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   scope: kvDead

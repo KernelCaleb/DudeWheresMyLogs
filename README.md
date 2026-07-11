@@ -12,6 +12,7 @@ DudeWheresMyLogs is a Python CLI tool that audits Azure diagnostic logging confi
 - Workspace usage analysis: flag destination workspaces nobody has queried in the lookback window, and workspaces where query auditing is disabled so usage cannot be assessed (needs Log Analytics Reader on the workspaces; degrades gracefully without it)
 - Ingestion liveness reconciliation: compare resources *configured* to ship against the `_ResourceId`s actually present in each workspace, flagging "configured but silent" pipelines (advisory: an idle resource legitimately emits nothing)
 - Activity Log export audit: flag subscriptions whose control-plane audit trail is not exported anywhere (Azure keeps it only 90 days; export to Log Analytics is free)
+- Cost estimates: estimated monthly spend per workspace (ingestion by table plan, Sentinel-aware rates, retention overage) and estimated monthly waste per finding (redundant duplicate flows, cross-region bandwidth), from a configurable list-price table (`--price-file`); flags destinations subject to the platform log export fee billed since June 2026. All figures are estimates, not bills
 - Map log destinations (Log Analytics, Storage Accounts, Event Hubs, Partner Solutions)
 - Storage account sub-service scanning (blob, queue, table, file)
 - Parallel scanning with configurable worker count
@@ -101,6 +102,7 @@ DudeWheresMyLogs -a --summary-only
 | `--checks` | Which finding checks to run and report: `missing`, `duplicates`, `dead-destinations`, `cross-region`, `silent-resources`, `unqueried-workspaces`, `no-query-auditing`, `no-activity-log-export` (default: all). Raw scan data in CSV/JSON is unaffected |
 | `--fail-on` | Finding categories that trigger exit code `1` in `--ci` mode; must be active checks (default: `missing,duplicates,dead-destinations,no-activity-log-export`) |
 | `--lookback-days` | Lookback window for workspace usage analysis (default: 30) |
+| `--price-file` | JSON price table overriding the built-in East US list prices used for cost estimates |
 | `--summary-only` | Omit per-resource detail for healthy/informational sections in HTML and Markdown reports |
 | `--version` | Show version and exit |
 

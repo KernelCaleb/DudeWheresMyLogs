@@ -43,15 +43,19 @@ _QUERY_COUNT_KQL = (
 )
 _INGEST_KQL = (
     "Usage | where IsBillable == true "
-    f"| summarize IngestGB = sum(Quantity) / 1024.0 // {_SELF_MARKER}"
+    f"| summarize IngestGB = sum(Quantity) / 1024.0 by DataType // {_SELF_MARKER}"
 )
-# Distinct source resources whose data actually landed in the workspace.
-# Log Analytics stores _ResourceId lowercased; the reconciliation in
-# flag_silent_resources lowercases the ARM side to match.
+# Source resources whose data actually landed in the workspace, with billed
+# volume (feeds both silent-resource reconciliation and cost attribution).
+# Log Analytics stores _ResourceId lowercased; flag_silent_resources
+# lowercases the ARM side to match.
 _SOURCES_KQL = (
     "union * | where isnotempty(_ResourceId) "
-    f"| summarize by _ResourceId // {_SELF_MARKER}"
+    f"| summarize BilledGB = sum(_BilledSize) / 1e9 by _ResourceId // {_SELF_MARKER}"
 )
+
+# API version for Microsoft.OperationsManagement/solutions (Sentinel detection)
+_SOLUTIONS_API_VERSION = "2015-11-01-preview"
 
 
 @dataclass
@@ -69,7 +73,12 @@ class WorkspaceUsage:
     audit_enabled: object = None   # True/False, None = could not determine
     query_count: object = None     # int, None = no data-plane access
     ingest_gb: object = None       # float, None = no data-plane access
+    ingest_gb_by_plan: object = None  # {"analytics": gb, "basic": gb, "auxiliary": gb}
     seen_resources: object = None  # distinct sources with data in window, None = unknown
+    sentinel_enabled: object = None  # True/False, None = could not determine
+    est_monthly_ingest: object = None     # USD estimate, None = not computed
+    est_monthly_retention: object = None
+    est_monthly_total: object = None
     lookback_days: int = 30
     access_error: str = ""
 
@@ -130,6 +139,19 @@ def _scalar(response):
     return 0
 
 
+def _two_column_rows(response, key_col, value_col):
+    """Yield (key, value) pairs from a KQL result, resolved by column name."""
+    for table in response.tables or []:
+        columns = [str(c) for c in (table.columns or [])]
+        try:
+            ki, vi = columns.index(key_col), columns.index(value_col)
+        except ValueError:
+            ki, vi = 0, 1
+        for row in table.rows or []:
+            if row is not None and len(row) > max(ki, vi):
+                yield row[ki], row[vi]
+
+
 def flag_silent_resources(results, seen_map):
     """Mark destinations whose resource's data never arrived at the workspace.
 
@@ -150,8 +172,8 @@ def flag_silent_resources(results, seen_map):
             d["silent"] = r.resource_id.lower() not in seen_map[wid]
 
 
-def _analyze_one(ws, mgmt_clients, monitor_clients, logs_client, lookback_days, lock,
-                 seen_map):
+def _analyze_one(ws, credential, mgmt_clients, monitor_clients, rm_clients,
+                 logs_client, lookback_days, lock, seen_map):
     """Fill in one WorkspaceUsage in place. Never raises."""
     # Management plane: workspace config + customer ID
     customer_id = None
@@ -173,6 +195,36 @@ def _analyze_one(ws, mgmt_clients, monitor_clients, logs_client, lookback_days, 
     except Exception as e:
         ws.access_error = f"config lookup failed: {str(e)[:80]}"
         return
+
+    # Management plane: Sentinel enabled? (SecurityInsights solution exists)
+    try:
+        from azure.mgmt.resource import ResourceManagementClient
+        with lock:
+            rm_client = rm_clients.get(ws.subscription_id)
+            if rm_client is None:
+                rm_client = ResourceManagementClient(
+                    credential, ws.subscription_id, **_retry_policy_kwargs())
+                rm_clients[ws.subscription_id] = rm_client
+        solution_id = (
+            f"/subscriptions/{ws.subscription_id}/resourceGroups/{ws.resource_group}"
+            f"/providers/Microsoft.OperationsManagement/solutions"
+            f"/SecurityInsights({ws.name})")
+        rm_client.resources.get_by_id(solution_id, api_version=_SOLUTIONS_API_VERSION)
+        ws.sentinel_enabled = True
+    except ResourceNotFoundError:
+        ws.sentinel_enabled = False
+    except Exception:
+        ws.sentinel_enabled = None
+
+    # Management plane: table plans (Basic/Auxiliary tables bill differently)
+    table_plans = {}
+    try:
+        for table in client.tables.list_by_workspace(ws.resource_group, ws.name):
+            plan = (getattr(table, "plan", None) or "").lower()
+            if plan and plan != "analytics":
+                table_plans[(table.name or "").lower()] = plan
+    except Exception:
+        pass
 
     # Management plane: is the workspace's own Audit category enabled?
     try:
@@ -209,20 +261,30 @@ def _analyze_one(ws, mgmt_clients, monitor_clients, logs_client, lookback_days, 
         response = logs_client.query_workspace(
             workspace_id=customer_id, query=_INGEST_KQL, timespan=timespan)
         if LogsQueryStatus is None or response.status != LogsQueryStatus.FAILURE:
-            ws.ingest_gb = round(float(_scalar(response)), 4)
+            total = 0.0
+            by_plan = {"analytics": 0.0, "basic": 0.0, "auxiliary": 0.0}
+            for name, value in _two_column_rows(response, "DataType", "IngestGB"):
+                if value is None:
+                    continue
+                gb = float(value)
+                plan = table_plans.get(str(name or "").lower(), "analytics")
+                by_plan[plan] = by_plan.get(plan, 0.0) + gb
+                total += gb
+            ws.ingest_gb = round(total, 4)
+            ws.ingest_gb_by_plan = {k: round(v, 4) for k, v in by_plan.items()}
     except Exception:
         pass
 
-    # Distinct sources whose data actually landed (feeds silent-resources)
+    # Sources whose data actually landed, with billed GB (feeds
+    # silent-resources reconciliation and per-finding cost attribution)
     try:
         response = logs_client.query_workspace(
             workspace_id=customer_id, query=_SOURCES_KQL, timespan=timespan)
         if LogsQueryStatus is None or response.status != LogsQueryStatus.FAILURE:
-            seen = set()
-            for table in response.tables or []:
-                for row in table.rows or []:
-                    if row and row[0]:
-                        seen.add(str(row[0]).lower())
+            seen = {}
+            for rid, gb in _two_column_rows(response, "_ResourceId", "BilledGB"):
+                if rid:
+                    seen[str(rid).lower()] = float(gb or 0.0)
             ws.seen_resources = len(seen)
             with lock:
                 seen_map[ws.workspace_id] = seen
@@ -287,10 +349,12 @@ def analyze_workspaces(credential, results, max_workers=10, lookback_days=30):
     sys.stderr.flush()
 
     seen_map = {}
+    rm_clients = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for ws in analyzable:
-            executor.submit(_analyze_one, ws, mgmt_clients, monitor_clients,
-                            logs_client, lookback_days, lock, seen_map)
+            executor.submit(_analyze_one, ws, credential, mgmt_clients,
+                            monitor_clients, rm_clients, logs_client,
+                            lookback_days, lock, seen_map)
 
     workspaces.sort(key=lambda w: (-w.shipping_resources, w.name.lower()))
     return workspaces, seen_map

@@ -1,0 +1,18 @@
+{
+  "_comment": "Default Azure logging list prices (East US, USD, July 2026). All outputs derived from these are ESTIMATES: regional rates, EA discounts, free allocations, and shared commitment tiers all change actual bills. Override with --price-file.",
+  "currency": "USD",
+  "log_analytics_analytics_per_gb": 2.30,
+  "sentinel_analytics_per_gb": 4.30,
+  "basic_logs_per_gb": 0.50,
+  "auxiliary_logs_per_gb": 0.05,
+  "interactive_retention_per_gb_month": 0.10,
+  "free_retention_days": 31,
+  "free_retention_days_sentinel": 90,
+  "platform_log_export_per_gb": 0.25,
+  "bandwidth_per_gb": {
+    "intra_continent": 0.02,
+    "na_eu_to_other": 0.05,
+    "asia_oceania_me_africa": 0.08,
+    "south_america": 0.16
+  }
+}
