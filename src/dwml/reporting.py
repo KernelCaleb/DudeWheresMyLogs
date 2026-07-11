@@ -5,14 +5,25 @@ from collections import Counter, defaultdict
 from dataclasses import asdict
 from datetime import datetime
 
+from .checks import get_checks, is_healthy
+from .diagnostics import has_cross_region, has_dead_destination
+from .workspaces import workspace_status
 
-def generate_report(results, fmt="html", output=None):
+
+def generate_report(results, fmt="html", output=None, summary_only=False, checks=None,
+                    ws_results=None):
     """Generate a report in the specified format.
 
     Args:
         results: list of DiagnosticResult objects
-        fmt: "html", "csv", or "json"
+        fmt: "html", "csv", "json", or "md"
         output: output file path (auto-generated if None)
+        summary_only: omit per-resource detail for non-finding sections
+            (HTML and Markdown only)
+        checks: iterable of active check names (None = all); controls which
+            finding sections appear in HTML/Markdown reports
+        ws_results: list of WorkspaceUsage from workspace analysis (None if
+            workspace checks were not run)
 
     Returns:
         The output file path.
@@ -26,10 +37,39 @@ def generate_report(results, fmt="html", output=None):
     if fmt == "json":
         if output is None:
             output = f"DudeWheresMyLogs_{timestamp}.json"
-        return generate_json(results, output)
+        return generate_json(results, output, ws_results=ws_results)
+    if fmt == "md":
+        if output is None:
+            output = f"DudeWheresMyLogs_{timestamp}.md"
+        return generate_markdown(results, output, summary_only=summary_only,
+                                 checks=checks, ws_results=ws_results)
     if output is None:
         output = f"DudeWheresMyLogs_{timestamp}.html"
-    return generate_html(results, output)
+    return generate_html(results, output, summary_only=summary_only, checks=checks,
+                         ws_results=ws_results)
+
+
+def build_payload(results, ws_results=None):
+    """Build the machine-readable report payload (shared by JSON and HTML)."""
+    status_counts = Counter(r.status for r in results)
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "summary": {
+            "total_resources": len(results),
+            "subscriptions_scanned": len({r.subscription_id for r in results}),
+            "status_counts": dict(status_counts),
+            "duplicate_count": sum(1 for r in results if r.duplicate),
+            "dead_destination_count": sum(1 for r in results if has_dead_destination(r)),
+            "cross_region_count": sum(1 for r in results if has_cross_region(r)),
+        },
+        "results": [asdict(result) for result in results],
+    }
+    if ws_results is not None:
+        for check in get_checks(scope="workspace"):
+            key = check.name.replace("-", "_") + "_count"
+            payload["summary"][key] = sum(1 for ws in ws_results if check.detect(ws))
+        payload["workspaces"] = [asdict(ws) for ws in ws_results]
+    return payload
 
 
 def generate_csv(results, output):
@@ -46,6 +86,8 @@ def generate_csv(results, output):
         "Destinations",
         "Log Categories",
         "Duplicate",
+        "Dead Destination",
+        "Cross Region",
         "Error",
     ]
 
@@ -56,6 +98,7 @@ def generate_csv(results, output):
             dest_str = "; ".join(
                 f"[{d.get('setting_name', '')}] {d['type']}: "
                 f"{d.get('name', '')} ({d.get('region', '')}) ({d['id']})"
+                + (" (NOT FOUND)" if d.get("not_found") else "")
                 for d in r.destinations
             ) if r.destinations else ""
             cats_str = "; ".join(
@@ -76,29 +119,143 @@ def generate_csv(results, output):
                 "Destinations": dest_str,
                 "Log Categories": cats_str,
                 "Duplicate": "Yes" if r.duplicate else "",
+                "Dead Destination": "Yes" if has_dead_destination(r) else "",
+                "Cross Region": "Yes" if has_cross_region(r) else "",
                 "Error": r.error_message,
             })
 
     return output
 
 
-def generate_json(results, output):
+def generate_json(results, output, ws_results=None):
     """Write results to a machine-readable JSON report."""
-    status_counts = Counter(r.status for r in results)
-    payload = {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "summary": {
-            "total_resources": len(results),
-            "subscriptions_scanned": len({r.subscription_id for r in results}),
-            "status_counts": dict(status_counts),
-            "duplicate_count": sum(1 for r in results if r.duplicate),
-        },
-        "results": [asdict(result) for result in results],
-    }
+    payload = build_payload(results, ws_results=ws_results)
 
     with open(output, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
+
+    return output
+
+
+def _md_escape(value):
+    """Escape a value for use inside a Markdown table cell."""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _dest_inline(r, dest_filter=None):
+    """One-line destination summary for a result, for Markdown/CSV-style views."""
+    parts = []
+    for d in r.destinations:
+        if dest_filter is not None and not dest_filter(d):
+            continue
+        label = f"{d.get('type', '')}: {d.get('name', '')}"
+        region = d.get("region", "")
+        if d.get("not_found"):
+            label += " (not found)"
+        elif region:
+            label += f" ({region})"
+        parts.append(label)
+    return "; ".join(parts)
+
+
+def generate_markdown(results, output, summary_only=False, checks=None, ws_results=None):
+    """Write results to a findings-focused Markdown report.
+
+    Healthy and informational resources are summarized as counts only;
+    each active check gets a per-resource findings table unless summary_only
+    is set. Workspace usage (when analyzed) gets its own table.
+    """
+    status_counts = Counter(r.status for r in results)
+    subs = sorted({r.subscription_name for r in results}, key=str.lower)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    active_checks = get_checks(checks, scope="resource")
+    ws_checks = get_checks(checks, scope="workspace")
+    ws_results = ws_results or []
+    findings = {c.name: [r for r in results if c.detect(r)] for c in active_checks}
+    healthy_count = sum(1 for r in results if is_healthy(r, checks))
+
+    lines = [
+        "# Azure Diagnostic Settings Audit",
+        "",
+        f"Generated {timestamp} | {len(subs)} subscription(s) | "
+        f"{len(results)} resource(s) evaluated",
+        "",
+        "## Summary",
+        "",
+        "| Finding | Count |",
+        "|---|---|",
+    ]
+    for c in active_checks:
+        lines.append(f"| {c.title} | {len(findings[c.name])} |")
+    for c in ws_checks:
+        lines.append(f"| {c.title} | {sum(1 for ws in ws_results if c.detect(ws))} |")
+    lines.extend([
+        f"| Healthy | {healthy_count} |",
+        f"| Not supported | {status_counts.get('Not Supported', 0)} |",
+        f"| Errors | {status_counts.get('Error', 0)} |",
+        "",
+    ])
+
+    def _sorted(items):
+        return sorted(items, key=lambda r: (
+            r.subscription_name.lower(), r.resource_group.lower(),
+            r.resource_type.lower(), r.resource_name.lower(),
+        ))
+
+    def _table(title, items, dest_col=None, dest_filter=None):
+        lines.append(f"## {title} ({len(items)})")
+        lines.append("")
+        if not items:
+            lines.append("None.")
+            lines.append("")
+            return
+        header = "| Subscription | Resource Group | Type | Name | Region |"
+        divider = "|---|---|---|---|---|"
+        if dest_col:
+            header += f" {dest_col} |"
+            divider += "---|"
+        lines.append(header)
+        lines.append(divider)
+        for r in _sorted(items):
+            row = (
+                f"| {_md_escape(r.subscription_name)} "
+                f"| {_md_escape(r.resource_group)} "
+                f"| {_md_escape(_short_type(r.resource_type))} "
+                f"| {_md_escape(r.resource_name)} "
+                f"| {_md_escape(r.resource_location)} |"
+            )
+            if dest_col:
+                row += f" {_md_escape(_dest_inline(r, dest_filter=dest_filter))} |"
+            lines.append(row)
+        lines.append("")
+
+    if not summary_only:
+        for c in active_checks:
+            _table(c.title, findings[c.name],
+                   dest_col=c.dest_label or None, dest_filter=c.dest_filter)
+
+    if ws_checks and ws_results:
+        lines.append(f"## Workspace Usage ({len(ws_results)})")
+        lines.append("")
+        lookback = ws_results[0].lookback_days
+        lines.append(f"| Workspace | Region | Resources Shipping | Retention "
+                     f"| SKU | Ingest GB ({lookback}d) | Queries ({lookback}d) | Status |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for ws in ws_results:
+            ingest = "?" if ws.ingest_gb is None else f"{ws.ingest_gb:g}"
+            queries = "?" if ws.query_count is None else str(ws.query_count)
+            lines.append(
+                f"| {_md_escape(ws.name)} | {_md_escape(ws.region)} "
+                f"| {ws.shipping_resources} | {ws.retention_days}d "
+                f"| {_md_escape(ws.sku)} | {ingest} | {queries} "
+                f"| {_md_escape(workspace_status(ws))} |"
+            )
+        lines.append("")
+
+    with open(output, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
     return output
 
@@ -157,9 +314,11 @@ def _build_dest_index(results):
         for d in r.destinations:
             key = (d["type"], d["id"])
             dest_to_results[key].append(r)
+            prior = dest_meta.get(key, {})
             dest_meta[key] = {
                 "name": d.get("name", ""),
                 "region": d.get("region", ""),
+                "not_found": prior.get("not_found", False) or d.get("not_found", False),
             }
 
     items = []
@@ -168,6 +327,7 @@ def _build_dest_index(results):
             "type": dtype,
             "name": dest_meta[(dtype, did)]["name"],
             "region": dest_meta[(dtype, did)]["region"],
+            "not_found": dest_meta[(dtype, did)]["not_found"],
             "id": did,
             "resources": rs,
         })
@@ -524,6 +684,7 @@ body {
   border-radius: 2px;
   font-weight: 500;
 }
+.la-tag.tag-warn { background: #fdf1e5; color: var(--accent); }
 
 /* Inline status text */
 .t-error { color: var(--error); font-weight: 500; }
@@ -601,18 +762,20 @@ body {
 """
 
 
-def generate_html(results, output):
+def generate_html(results, output, summary_only=False, checks=None, ws_results=None):
     """Write results to a self-contained HTML report."""
     e = html.escape
     status_counts = Counter(r.status for r in results)
     total = len(results)
-    missing_count = status_counts.get("Missing", 0)
-    enabled_count = status_counts.get("Enabled", 0)
     notsup_count = status_counts.get("Not Supported", 0)
     error_count = status_counts.get("Error", 0)
-    dup_count = sum(1 for r in results if r.duplicate)
-    healthy_count = max(enabled_count - dup_count, 0)
     info_count = notsup_count + error_count
+
+    active_checks = get_checks(checks, scope="resource")
+    ws_checks = get_checks(checks, scope="workspace")
+    ws_results = ws_results or []
+    findings = {c.name: [r for r in results if c.detect(r)] for c in active_checks}
+    healthy_count = sum(1 for r in results if is_healthy(r, checks))
 
     subs = sorted(
         {(r.subscription_name, r.subscription_id) for r in results},
@@ -621,11 +784,7 @@ def generate_html(results, output):
     multi_sub = len(subs) > 1
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    missing_grouped = _group_by_sub_rg([r for r in results if r.status == "Missing"])
-    duplicate_grouped = _group_by_sub_rg([r for r in results if r.duplicate])
-    healthy_grouped = _group_by_sub_rg([
-        r for r in results if r.status == "Enabled" and not r.duplicate
-    ])
+    healthy_grouped = _group_by_sub_rg([r for r in results if is_healthy(r, checks)])
     info_grouped = _group_by_sub_rg([
         r for r in results if r.status in ("Not Supported", "Error")
     ])
@@ -654,12 +813,18 @@ def generate_html(results, output):
             la_type = d.get("la_destination_type", "")
             la_html = f'<span class="la-tag">{e(la_type)}</span>' if la_type else ""
             did = d.get("id", "")
+            if d.get("not_found"):
+                region_html = '<span class="t-error">not found</span>'
+            else:
+                region_html = e(d.get("region", ""))
+                if d.get("cross_region"):
+                    region_html += ' <span class="la-tag tag-warn">cross-region</span>'
             rows.append(
                 "<tr>"
                 f'<td class="name-cell">{e(d.get("setting_name", ""))}</td>'
                 f"<td>{e(d.get('type', ''))}{la_html}</td>"
                 f'<td class="name-cell">{e(d.get("name", ""))}</td>'
-                f"<td>{e(d.get('region', ''))}</td>"
+                f"<td>{region_html}</td>"
                 f'<td class="id-cell" title="{e(did)}">{e(_short_id(did))}</td>'
                 f'<td class="cats-cell">{cats_html}</td>'
                 "</tr>"
@@ -782,18 +947,20 @@ def generate_html(results, output):
             "</details>"
         )
 
-    def _build_section(num, title, count, grouped, *, kind, default_open, severity, anchor):
+    def _build_section(num, title, count, grouped, *, kind, default_open, severity, anchor,
+                       omit_details=False):
         flag_class = f" flag-{severity}" if severity else ""
         anchor_link = f'<a class="anchor" href="#{anchor}" aria-label="link to {e(title)}">#</a>'
-        if count == 0:
+        if count == 0 or omit_details:
+            desc = "none" if count == 0 else "details omitted (summary-only)"
             return (
                 '<div class="section-wrap">'
                 f"{anchor_link}"
                 f'<section class="section section-empty{flag_class}" id="{anchor}">'
                 f'<span class="sec-num">{num}.</span>'
                 f'<span class="sec-title">{e(title)}</span>'
-                '<span class="sec-count">0</span>'
-                '<span class="sec-desc">none</span>'
+                f'<span class="sec-count">{count}</span>'
+                f'<span class="sec-desc">{desc}</span>'
                 "</section>"
                 "</div>"
             )
@@ -845,10 +1012,13 @@ def generate_html(results, output):
         items_html = []
         for d in dest_index:
             display_name = d["name"] or _short_id(d["id"])
-            region_html = (
-                f'<span class="dest-region">{e(d["region"])}</span>'
-                if d["region"] else ""
-            )
+            if d.get("not_found"):
+                region_html = '<span class="t-error">not found</span>'
+            else:
+                region_html = (
+                    f'<span class="dest-region">{e(d["region"])}</span>'
+                    if d["region"] else ""
+                )
             resources_sorted = sorted(
                 d["resources"],
                 key=lambda r: (
@@ -906,40 +1076,123 @@ def generate_html(results, output):
         for name, sid in subs
     )
 
-    overview_rows = (
-        f'<tr><td><a href="#missing">Missing diagnostics</a></td>{_fmt_count(missing_count, "warn")}</tr>'
-        f'<tr><td><a href="#duplicate">Duplicate shipping</a></td>{_fmt_count(dup_count, "dup")}</tr>'
+    overview_parts = []
+    for c in active_checks:
+        overview_parts.append(
+            f'<tr><td><a href="#{c.anchor}">{e(c.title)}</a></td>'
+            f"{_fmt_count(len(findings[c.name]), c.severity)}</tr>"
+        )
+    for c in ws_checks:
+        ws_count = sum(1 for ws in ws_results if c.detect(ws))
+        overview_parts.append(
+            f'<tr><td><a href="#{c.anchor}">{e(c.title)}</a></td>'
+            f"{_fmt_count(ws_count, c.severity)}</tr>"
+        )
+    overview_parts.append(
         f'<tr><td><a href="#healthy">Healthy</a></td>{_fmt_count(healthy_count, "ok")}</tr>'
         f'<tr><td><a href="#informational">Not supported</a></td>{_fmt_count(notsup_count)}</tr>'
         f'<tr><td><a href="#informational">Errors</a></td>{_fmt_count(error_count, "err")}</tr>'
     )
+    overview_rows = "".join(overview_parts)
 
-    s1 = _build_section(
-        1, "Missing Diagnostics", missing_count, missing_grouped,
-        kind="missing", default_open=missing_count > 0, severity="warn",
-        anchor="missing",
-    )
-    s2 = _build_section(
-        2, "Duplicate Shipping", dup_count, duplicate_grouped,
-        kind="duplicate", default_open=dup_count > 0, severity="dup",
-        anchor="duplicate",
-    )
-    s3 = _build_section(
-        3, "Healthy Resources", healthy_count, healthy_grouped,
+    sections = []
+    num = 0
+    for c in active_checks:
+        num += 1
+        count = len(findings[c.name])
+        sections.append(_build_section(
+            num, c.title, count, _group_by_sub_rg(findings[c.name]),
+            kind=c.row_kind, default_open=c.default_open and count > 0,
+            severity=c.severity if count > 0 else None,
+            anchor=c.anchor,
+        ))
+    sections.append(_build_section(
+        num + 1, "Healthy Resources", healthy_count, healthy_grouped,
         kind="healthy", default_open=False,
         severity="ok" if healthy_count > 0 else None,
-        anchor="healthy",
-    )
-    s4 = _build_section(
-        4, "Informational", info_count, info_grouped,
+        anchor="healthy", omit_details=summary_only,
+    ))
+    sections.append(_build_section(
+        num + 2, "Informational", info_count, info_grouped,
         kind="info", default_open=False,
         severity="err" if error_count > 0 else None,
-        anchor="informational",
-    )
-    s5 = _build_dest_section(5, anchor="destinations")
+        anchor="informational", omit_details=summary_only,
+    ))
+    num += 2
+
+    if ws_checks:
+        num += 1
+        flagged = sum(
+            1 for ws in ws_results if any(c.detect(ws) for c in ws_checks))
+        lookback = ws_results[0].lookback_days if ws_results else 30
+        if not ws_results:
+            sections.append(
+                '<div class="section-wrap">'
+                '<a class="anchor" href="#workspace-usage" aria-label="link to Workspace Usage">#</a>'
+                f'<section class="section section-empty" id="workspace-usage">'
+                f'<span class="sec-num">{num}.</span>'
+                '<span class="sec-title">Workspace Usage</span>'
+                '<span class="sec-count">0</span>'
+                '<span class="sec-desc">no Log Analytics destinations</span>'
+                "</section></div>"
+            )
+        else:
+            ws_rows = []
+            for ws in ws_results:
+                flagged_here = any(c.detect(ws) for c in ws_checks)
+                status_html = e(workspace_status(ws))
+                if flagged_here:
+                    status_html = f'<span class="t-error">{status_html}</span>'
+                ingest = "?" if ws.ingest_gb is None else f"{ws.ingest_gb:g}"
+                queries = "?" if ws.query_count is None else str(ws.query_count)
+                ws_rows.append(
+                    "<tr>"
+                    f'<td class="name-cell" title="{e(ws.workspace_id)}">{e(ws.name)}</td>'
+                    f"<td>{e(ws.region)}</td>"
+                    f"<td>{ws.shipping_resources}</td>"
+                    f"<td>{ws.retention_days}d</td>"
+                    f"<td>{e(ws.sku)}</td>"
+                    f"<td>{ingest}</td>"
+                    f"<td>{queries}</td>"
+                    f"<td>{status_html}</td>"
+                    "</tr>"
+                )
+            ws_table = (
+                '<table class="settings">'
+                "<thead><tr>"
+                "<th>Workspace</th><th>Region</th><th>Resources</th>"
+                f"<th>Retention</th><th>SKU</th><th>Ingest GB ({lookback}d)</th>"
+                f"<th>Queries ({lookback}d)</th><th>Status</th>"
+                "</tr></thead><tbody>" + "".join(ws_rows) + "</tbody></table>"
+            )
+            severity_class = " flag-warn" if flagged else ""
+            open_attr = " open" if flagged else ""
+            sections.append(
+                '<div class="section-wrap">'
+                '<a class="anchor" href="#workspace-usage" aria-label="link to Workspace Usage">#</a>'
+                f'<details class="section{severity_class}"{open_attr} id="workspace-usage">'
+                '<summary class="sec-summary">'
+                f'<span class="sec-num">{num}.</span>'
+                '<span class="sec-title">Workspace Usage</span>'
+                f'<span class="sec-count">{len(ws_results)}</span>'
+                "</summary>"
+                f'<div class="sec-body">{ws_table}</div>'
+                "</details></div>"
+            )
+
+    sections.append(_build_dest_section(num + 1, anchor="destinations"))
+    sections_html = "\n".join(sections)
 
     sub_label = "subscription" if len(subs) == 1 else "subscriptions"
     res_label = "resource" if total == 1 else "resources"
+
+    # Embed the machine-readable payload so any HTML report can later be
+    # re-parsed or diffed without re-scanning. "</" is escaped so result
+    # content can never terminate the script block early.
+    embedded_json = json.dumps(
+        build_payload(results, ws_results=ws_results if ws_checks else None),
+        sort_keys=True,
+    ).replace("</", "<\\/")
 
     body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -974,11 +1227,7 @@ def generate_html(results, output):
   <table class="overview-tbl"><tbody>{overview_rows}</tbody></table>
 </section>
 
-{s1}
-{s2}
-{s3}
-{s4}
-{s5}
+{sections_html}
 
 <footer class="footer">
   <span>DudeWheresMyLogs &middot; Azure Diagnostic Logging Audit</span>
@@ -986,6 +1235,7 @@ def generate_html(results, output):
 </footer>
 
 </div>
+<script type="application/json" id="dwml-data">{embedded_json}</script>
 </body>
 </html>
 """

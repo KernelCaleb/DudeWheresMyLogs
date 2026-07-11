@@ -4,7 +4,16 @@ import sys
 from collections import Counter
 
 from . import __version__
+from .checks import CHECK_NAMES, DEFAULT_FAIL_ON, get_check, get_checks
 from .reporting import generate_report
+
+
+def _positive_int(value):
+    """argparse type: integer >= 1."""
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
 
 
 def build_parser():
@@ -30,7 +39,7 @@ def build_parser():
     )
     parser.add_argument(
         "-f", "--format",
-        choices=["html", "csv", "json"],
+        choices=["html", "csv", "json", "md"],
         default="html",
         help="Output format (default: html).",
     )
@@ -41,7 +50,7 @@ def build_parser():
     )
     parser.add_argument(
         "-w", "--workers",
-        type=int,
+        type=_positive_int,
         default=10,
         metavar="N",
         help="Number of parallel workers (default: 10).",
@@ -68,6 +77,36 @@ def build_parser():
         "--ci",
         action="store_true",
         help="Use CI-friendly exit codes: 0=clean, 1=findings, 2=errors.",
+    )
+    parser.add_argument(
+        "--checks",
+        action="append",
+        metavar="CHECK",
+        help="Finding checks to run and report. "
+             f"Choices: {', '.join(CHECK_NAMES)}. "
+             "Repeatable or comma-separated. Default: all checks.",
+    )
+    parser.add_argument(
+        "--fail-on",
+        action="append",
+        metavar="CATEGORY",
+        help="Finding categories that count as findings in --ci mode. "
+             f"Choices: {', '.join(CHECK_NAMES)}. "
+             "Repeatable or comma-separated. Must be active checks. "
+             f"Default: {','.join(DEFAULT_FAIL_ON)}.",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Omit per-resource detail for healthy and informational sections "
+             "in HTML/Markdown reports (findings stay fully detailed).",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=_positive_int,
+        default=30,
+        metavar="N",
+        help="Lookback window for workspace usage analysis (default: 30).",
     )
     parser.add_argument(
         "--version",
@@ -117,8 +156,12 @@ def filter_resources(resources, include_types=None, exclude_types=None, resource
     return filtered
 
 
-def _determine_exit_code(results, ci_mode=False):
-    """Return the appropriate process exit code for the scan results."""
+def _determine_exit_code(results, ci_mode=False, fail_on=None, ws_results=None):
+    """Return the appropriate process exit code for the scan results.
+
+    fail_on is an iterable of check names controlling what counts as a
+    finding (exit 1). Scan errors always take precedence (exit 2).
+    """
     if not ci_mode:
         return 0
 
@@ -126,20 +169,56 @@ def _determine_exit_code(results, ci_mode=False):
     if has_errors:
         return 2
 
-    has_findings = any(
-        result.status == "Missing" or result.duplicate
-        for result in results
-    )
-    return 1 if has_findings else 0
+    categories = DEFAULT_FAIL_ON if fail_on is None else fail_on
+    for category in categories:
+        check = get_check(category)
+        pool = results if check.scope == "resource" else (ws_results or [])
+        if any(check.detect(item) for item in pool):
+            return 1
+    return 0
+
+
+def _parse_checks(values, parser):
+    """Validate --checks values; returns a tuple of check names (all if unset)."""
+    if not values:
+        return CHECK_NAMES
+    names = _normalize_patterns(values)
+    invalid = [c for c in names if c not in CHECK_NAMES]
+    if invalid:
+        parser.error(
+            f"invalid --checks value: {', '.join(invalid)} "
+            f"(choose from {', '.join(CHECK_NAMES)})"
+        )
+    return tuple(dict.fromkeys(names))
+
+
+def _parse_fail_on(values, parser, active_checks):
+    """Validate --fail-on values against active checks; returns a tuple of names."""
+    if not values:
+        return tuple(c for c in DEFAULT_FAIL_ON if c in active_checks)
+    categories = _normalize_patterns(values)
+    invalid = [c for c in categories if c not in CHECK_NAMES]
+    if invalid:
+        parser.error(
+            f"invalid --fail-on category: {', '.join(invalid)} "
+            f"(choose from {', '.join(CHECK_NAMES)})"
+        )
+    inactive = [c for c in categories if c not in active_checks]
+    if inactive:
+        parser.error(
+            f"--fail-on category not in active --checks: {', '.join(inactive)}"
+        )
+    return tuple(dict.fromkeys(categories))
 
 
 def select_subscriptions_interactive(subscriptions):
-    """Display subscriptions and let the user pick."""
+    """Display subscriptions and let the user pick one or more."""
     print("\nAvailable Subscriptions:")
     for i, sub in enumerate(subscriptions):
         print(f"  [{i}] {sub['name']} ({sub['id']})")
 
-    print("\n  [A] Scan ALL subscriptions")
+    print("\n  Enter one or more numbers (comma-separated, e.g. 0,2,5)")
+    print("  [A] Scan ALL subscriptions")
     print("  [Q] Quit")
 
     while True:
@@ -152,18 +231,23 @@ def select_subscriptions_interactive(subscriptions):
             return subscriptions
 
         try:
-            idx = int(choice)
-            if 0 <= idx < len(subscriptions):
-                return [subscriptions[idx]]
-            print("Invalid selection. Try again.")
+            indices = [int(part) for part in choice.replace(" ", "").split(",") if part]
         except ValueError:
-            print("Enter a number, A, or Q.")
+            print("Enter numbers (comma-separated), A, or Q.")
+            continue
+
+        if indices and all(0 <= idx < len(subscriptions) for idx in indices):
+            # Preserve order, drop duplicates
+            return [subscriptions[idx] for idx in dict.fromkeys(indices)]
+        print("Invalid selection. Try again.")
 
 
 def run(argv=None):
     """Run DudeWheresMyLogs and return a process exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    active_checks = _parse_checks(args.checks, parser)
+    fail_on = _parse_fail_on(args.fail_on, parser, active_checks)
 
     from .azure import get_credential, list_resources, list_subscriptions
     from .diagnostics import check_all_diagnostics
@@ -175,26 +259,27 @@ def run(argv=None):
     credential = get_credential()
     print("Authenticated successfully.\n")
 
-    # Resolve subscriptions
+    # Resolve subscriptions. In CI mode an empty subscription list is an
+    # operational error (exit 2), not a findings result (exit 1).
     all_subs = list_subscriptions(credential)
     if not all_subs:
         print("No subscriptions found.")
-        return 1
+        return 2 if args.ci else 1
 
     if args.all_subs:
         selected = all_subs
         print(f"Scanning all {len(selected)} subscriptions.\n")
     elif args.subscription:
-        sub_map = {s["id"]: s for s in all_subs}
+        sub_map = {s["id"].lower(): s for s in all_subs}
         selected = []
         for sid in args.subscription:
-            if sid in sub_map:
-                selected.append(sub_map[sid])
+            if sid.lower() in sub_map:
+                selected.append(sub_map[sid.lower()])
             else:
                 print(f"Warning: subscription {sid} not found or not accessible, skipping.")
         if not selected:
             print("No valid subscriptions to scan.")
-            return 1
+            return 2 if args.ci else 1
     else:
         selected = select_subscriptions_interactive(all_subs)
 
@@ -232,22 +317,39 @@ def run(argv=None):
         print("No results to report.")
         return 0
 
+    # Workspace usage analysis (only when a workspace-scope check is active)
+    ws_results = []
+    if get_checks(active_checks, scope="workspace"):
+        from .workspaces import analyze_workspaces
+        ws_results = analyze_workspaces(
+            credential, all_results,
+            max_workers=args.workers, lookback_days=args.lookback_days,
+        )
+
     # Print summary
     status_counts = Counter(r.status for r in all_results)
-    dup_count = sum(1 for r in all_results if r.duplicate)
 
     print("--- Summary ---")
-    print(f"  Total entries:   {len(all_results)}")
-    print(f"  Enabled:         {status_counts.get('Enabled', 0)}")
-    print(f"  Missing:         {status_counts.get('Missing', 0)}")
-    print(f"  Duplicates:      {dup_count}")
-    print(f"  Not Supported:   {status_counts.get('Not Supported', 0)}")
-    print(f"  Errors:          {status_counts.get('Error', 0)}")
+    print(f"  {'Total entries:':<24}{len(all_results)}")
+    print(f"  {'Enabled:':<24}{status_counts.get('Enabled', 0)}")
+    for check in get_checks(active_checks, scope="resource"):
+        count = sum(1 for r in all_results if check.detect(r))
+        print(f"  {check.title + ':':<24}{count}")
+    for check in get_checks(active_checks, scope="workspace"):
+        count = sum(1 for ws in ws_results if check.detect(ws))
+        print(f"  {check.title + ':':<24}{count}")
+    print(f"  {'Not Supported:':<24}{status_counts.get('Not Supported', 0)}")
+    print(f"  {'Errors:':<24}{status_counts.get('Error', 0)}")
 
     # Generate report
-    output_path = generate_report(all_results, fmt=args.format, output=args.output)
+    output_path = generate_report(
+        all_results, fmt=args.format, output=args.output,
+        summary_only=args.summary_only, checks=active_checks,
+        ws_results=ws_results,
+    )
     print(f"\nReport saved to: {output_path}")
-    return _determine_exit_code(all_results, ci_mode=args.ci)
+    return _determine_exit_code(all_results, ci_mode=args.ci, fail_on=fail_on,
+                                ws_results=ws_results)
 
 
 def main():
