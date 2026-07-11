@@ -45,6 +45,13 @@ _INGEST_KQL = (
     "Usage | where IsBillable == true "
     f"| summarize IngestGB = sum(Quantity) / 1024.0 // {_SELF_MARKER}"
 )
+# Distinct source resources whose data actually landed in the workspace.
+# Log Analytics stores _ResourceId lowercased; the reconciliation in
+# flag_silent_resources lowercases the ARM side to match.
+_SOURCES_KQL = (
+    "union * | where isnotempty(_ResourceId) "
+    f"| summarize by _ResourceId // {_SELF_MARKER}"
+)
 
 
 @dataclass
@@ -62,6 +69,7 @@ class WorkspaceUsage:
     audit_enabled: object = None   # True/False, None = could not determine
     query_count: object = None     # int, None = no data-plane access
     ingest_gb: object = None       # float, None = no data-plane access
+    seen_resources: object = None  # distinct sources with data in window, None = unknown
     lookback_days: int = 30
     access_error: str = ""
 
@@ -122,7 +130,28 @@ def _scalar(response):
     return 0
 
 
-def _analyze_one(ws, mgmt_clients, monitor_clients, logs_client, lookback_days, lock):
+def flag_silent_resources(results, seen_map):
+    """Mark destinations whose resource's data never arrived at the workspace.
+
+    seen_map: workspace ARM ID -> set of lowercased _ResourceIds observed in
+    the lookback window. Workspaces absent from the map could not be queried;
+    their destinations are left unflagged (unknown, not silent).
+
+    A silent destination is a signal, not proof of breakage: a resource with
+    no activity in the window legitimately emits nothing.
+    """
+    for r in results:
+        for d in r.destinations:
+            if d.get("type") != "Log Analytics" or d.get("not_found"):
+                continue
+            wid = d.get("id", "")
+            if wid not in seen_map:
+                continue
+            d["silent"] = r.resource_id.lower() not in seen_map[wid]
+
+
+def _analyze_one(ws, mgmt_clients, monitor_clients, logs_client, lookback_days, lock,
+                 seen_map):
     """Fill in one WorkspaceUsage in place. Never raises."""
     # Management plane: workspace config + customer ID
     customer_id = None
@@ -184,12 +213,31 @@ def _analyze_one(ws, mgmt_clients, monitor_clients, logs_client, lookback_days, 
     except Exception:
         pass
 
+    # Distinct sources whose data actually landed (feeds silent-resources)
+    try:
+        response = logs_client.query_workspace(
+            workspace_id=customer_id, query=_SOURCES_KQL, timespan=timespan)
+        if LogsQueryStatus is None or response.status != LogsQueryStatus.FAILURE:
+            seen = set()
+            for table in response.tables or []:
+                for row in table.rows or []:
+                    if row and row[0]:
+                        seen.add(str(row[0]).lower())
+            ws.seen_resources = len(seen)
+            with lock:
+                seen_map[ws.workspace_id] = seen
+    except Exception:
+        # Timeout or query failure on a large workspace: liveness unknown
+        pass
+
 
 def analyze_workspaces(credential, results, max_workers=10, lookback_days=30):
     """Analyze every Log Analytics destination workspace found in the scan.
 
-    Returns a list of WorkspaceUsage sorted by shipping resource count
-    (highest impact first).
+    Returns (ws_results, seen_map): WorkspaceUsage list sorted by shipping
+    resource count (highest impact first), and a map of workspace ARM ID ->
+    set of lowercased _ResourceIds observed in the lookback window (only for
+    workspaces whose data plane was queryable).
     """
     if LogAnalyticsManagementClient is None:
         raise RuntimeError(
@@ -198,7 +246,7 @@ def analyze_workspaces(credential, results, max_workers=10, lookback_days=30):
 
     shipping = _collect_destination_workspaces(results)
     if not shipping:
-        return []
+        return [], {}
 
     workspaces = []
     for wid, count in shipping.items():
@@ -238,10 +286,11 @@ def analyze_workspaces(credential, results, max_workers=10, lookback_days=30):
     sys.stderr.write(f"Analyzing {len(analyzable)} destination workspace(s)...\n")
     sys.stderr.flush()
 
+    seen_map = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for ws in analyzable:
             executor.submit(_analyze_one, ws, mgmt_clients, monitor_clients,
-                            logs_client, lookback_days, lock)
+                            logs_client, lookback_days, lock, seen_map)
 
     workspaces.sort(key=lambda w: (-w.shipping_resources, w.name.lower()))
-    return workspaces
+    return workspaces, seen_map

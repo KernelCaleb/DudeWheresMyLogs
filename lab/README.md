@@ -34,6 +34,13 @@ DudeWheresMyLogs -s <subscription-id> --resource-group rg-dwml-lab --ci
 | `law-dwml-primary` | Workspace Usage: Unqueried until a real (unmarked) query lands in LAQueryLogs (~5-15 min ingestion lag), then Active. The tool's own queries are self-excluded via the dwml-usage-check marker |
 | `law-dwml-secondary` | Unqueried Workspaces finding (auditing on, never queried) |
 | `law-dwml-west` | No Query Auditing finding (Audit category not enabled) |
+| `stdwml*/blob` | Configured But Silent: blob diagnostics enabled but no blob operations ever occur, so no data arrives |
+
+For silent-resource verification: generate activity on some vaults (e.g.
+`az keyvault secret set`) and wait out the ~5-15 min ingestion lag; touched
+vaults flip to flowing while the blob service stays silent. Note KV
+AuditEvent includes control-plane operations (VaultGet from `az keyvault
+list`), so merely listing vaults makes them look active.
 
 A full lab scan in `--ci` mode must exit `1` (findings). Scoping to
 `--include-types "Microsoft.Network/*" --fail-on duplicates` must exit `0`.

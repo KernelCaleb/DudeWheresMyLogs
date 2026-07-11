@@ -8,7 +8,12 @@ from dwml.checks import CHECK_NAMES, get_check, is_healthy
 from dwml.cli import _determine_exit_code, build_parser, _parse_checks, filter_resources
 from dwml.diagnostics import DiagnosticResult, _extract_destinations, _flag_cross_region
 from dwml.reporting import generate_html, generate_json, generate_markdown
-from dwml.workspaces import WorkspaceUsage, _workspace_audit_enabled, workspace_status
+from dwml.workspaces import (
+    WorkspaceUsage,
+    _workspace_audit_enabled,
+    flag_silent_resources,
+    workspace_status,
+)
 
 
 def _setting(name="setting", workspace_id=None, storage_account_id=None,
@@ -297,6 +302,42 @@ class WorkspaceUsageTests(unittest.TestCase):
         self.assertIn("Unqueried (30d)", html_content)
         self.assertIn("## Workspace Usage (1)", md_content)
         self.assertIn("Unqueried (30d)", md_content)
+
+
+class SilentResourceTests(unittest.TestCase):
+    def _la_dest(self, wid=WORKSPACE_A, not_found=False):
+        return {"setting_name": "s", "type": "Log Analytics", "name": "law",
+                "id": wid, "log_categories": [], "la_destination_type": "",
+                "region": "eastus", "not_found": not_found}
+
+    def test_flags_resource_missing_from_workspace_data(self):
+        silent = _result(destinations=[self._la_dest()])
+        flowing = _result(destinations=[self._la_dest()])
+        # The scanned resource ID, lowercased, is present for "flowing" only
+        seen_map = {WORKSPACE_A: {flowing.resource_id.lower()}}
+        flag_silent_resources([flowing], seen_map)
+        flag_silent_resources([silent], {WORKSPACE_A: set()})
+        self.assertFalse(flowing.destinations[0].get("silent"))
+        self.assertTrue(silent.destinations[0].get("silent"))
+        self.assertTrue(get_check("silent-resources").detect(silent))
+        self.assertFalse(get_check("silent-resources").detect(flowing))
+
+    def test_unknown_and_dead_workspaces_not_flagged(self):
+        unknown = _result(destinations=[self._la_dest()])
+        dead = _result(destinations=[self._la_dest(not_found=True)])
+        flag_silent_resources([unknown, dead], {})  # workspace not queryable
+        flag_silent_resources([dead], {WORKSPACE_A: set()})
+        self.assertNotIn("silent", unknown.destinations[0])
+        self.assertNotIn("silent", dead.destinations[0])
+
+    def test_matching_is_case_insensitive(self):
+        r = _result(destinations=[self._la_dest()])
+        # Log Analytics lowercases _ResourceId; ARM IDs are mixed case
+        seen_map = {WORKSPACE_A: {r.resource_id.lower()}}
+        r.resource_id = r.resource_id.upper()
+        seen_map[WORKSPACE_A] = {r.resource_id.lower()}
+        flag_silent_resources([r], seen_map)
+        self.assertFalse(r.destinations[0]["silent"])
 
 
 class ReportingTests(unittest.TestCase):

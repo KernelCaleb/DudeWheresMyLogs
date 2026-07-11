@@ -61,6 +61,9 @@ def build_payload(results, ws_results=None):
             "duplicate_count": sum(1 for r in results if r.duplicate),
             "dead_destination_count": sum(1 for r in results if has_dead_destination(r)),
             "cross_region_count": sum(1 for r in results if has_cross_region(r)),
+            "silent_resource_count": sum(
+                1 for r in results
+                if any(d.get("silent") for d in r.destinations)),
         },
         "results": [asdict(result) for result in results],
     }
@@ -240,15 +243,16 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
         lines.append(f"## Workspace Usage ({len(ws_results)})")
         lines.append("")
         lookback = ws_results[0].lookback_days
-        lines.append(f"| Workspace | Region | Resources Shipping | Retention "
-                     f"| SKU | Ingest GB ({lookback}d) | Queries ({lookback}d) | Status |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append(f"| Workspace | Region | Resources Shipping | Sources Seen "
+                     f"| Retention | SKU | Ingest GB ({lookback}d) | Queries ({lookback}d) | Status |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for ws in ws_results:
             ingest = "?" if ws.ingest_gb is None else f"{ws.ingest_gb:g}"
             queries = "?" if ws.query_count is None else str(ws.query_count)
+            seen = "?" if ws.seen_resources is None else str(ws.seen_resources)
             lines.append(
                 f"| {_md_escape(ws.name)} | {_md_escape(ws.region)} "
-                f"| {ws.shipping_resources} | {ws.retention_days}d "
+                f"| {ws.shipping_resources} | {seen} | {ws.retention_days}d "
                 f"| {_md_escape(ws.sku)} | {ingest} | {queries} "
                 f"| {_md_escape(workspace_status(ws))} |"
             )
@@ -1145,11 +1149,13 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
                     status_html = f'<span class="t-error">{status_html}</span>'
                 ingest = "?" if ws.ingest_gb is None else f"{ws.ingest_gb:g}"
                 queries = "?" if ws.query_count is None else str(ws.query_count)
+                seen = "?" if ws.seen_resources is None else str(ws.seen_resources)
                 ws_rows.append(
                     "<tr>"
                     f'<td class="name-cell" title="{e(ws.workspace_id)}">{e(ws.name)}</td>'
                     f"<td>{e(ws.region)}</td>"
                     f"<td>{ws.shipping_resources}</td>"
+                    f"<td>{seen}</td>"
                     f"<td>{ws.retention_days}d</td>"
                     f"<td>{e(ws.sku)}</td>"
                     f"<td>{ingest}</td>"
@@ -1161,6 +1167,7 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
                 '<table class="settings">'
                 "<thead><tr>"
                 "<th>Workspace</th><th>Region</th><th>Resources</th>"
+                f"<th>Sources Seen</th>"
                 f"<th>Retention</th><th>SKU</th><th>Ingest GB ({lookback}d)</th>"
                 f"<th>Queries ({lookback}d)</th><th>Status</th>"
                 "</tr></thead><tbody>" + "".join(ws_rows) + "</tbody></table>"

@@ -317,14 +317,21 @@ def run(argv=None):
         print("No results to report.")
         return 0
 
-    # Workspace usage analysis (only when a workspace-scope check is active)
+    # Workspace usage analysis: needed by workspace-scope checks and by the
+    # resource-scope silent-resources reconciliation
     ws_results = []
-    if get_checks(active_checks, scope="workspace"):
-        from .workspaces import analyze_workspaces
-        ws_results = analyze_workspaces(
+    needs_ws_analysis = (
+        get_checks(active_checks, scope="workspace")
+        or "silent-resources" in active_checks
+    )
+    if needs_ws_analysis:
+        from .workspaces import analyze_workspaces, flag_silent_resources
+        ws_results, seen_map = analyze_workspaces(
             credential, all_results,
             max_workers=args.workers, lookback_days=args.lookback_days,
         )
+        if "silent-resources" in active_checks:
+            flag_silent_resources(all_results, seen_map)
 
     # Print summary
     status_counts = Counter(r.status for r in all_results)

@@ -10,6 +10,7 @@ DudeWheresMyLogs is a Python CLI tool that audits Azure diagnostic logging confi
 - Detect dead destinations (diagnostic settings still shipping logs to deleted workspaces, storage accounts, or event hubs)
 - Flag cross-region log shipping (egress cost and data-residency concern)
 - Workspace usage analysis: flag destination workspaces nobody has queried in the lookback window, and workspaces where query auditing is disabled so usage cannot be assessed (needs Log Analytics Reader on the workspaces; degrades gracefully without it)
+- Ingestion liveness reconciliation: compare resources *configured* to ship against the `_ResourceId`s actually present in each workspace, flagging "configured but silent" pipelines (advisory: an idle resource legitimately emits nothing)
 - Map log destinations (Log Analytics, Storage Accounts, Event Hubs, Partner Solutions)
 - Storage account sub-service scanning (blob, queue, table, file)
 - Parallel scanning with configurable worker count
@@ -96,7 +97,7 @@ DudeWheresMyLogs -a --summary-only
 | `--exclude-types` | Skip matching resource types (supports wildcards, repeatable) |
 | `--resource-group` | Only scan matching resource groups (supports wildcards, repeatable) |
 | `--ci` | Return `0` for clean, `1` for findings, `2` for scan errors |
-| `--checks` | Which finding checks to run and report: `missing`, `duplicates`, `dead-destinations`, `cross-region`, `unqueried-workspaces`, `no-query-auditing` (default: all). Raw scan data in CSV/JSON is unaffected |
+| `--checks` | Which finding checks to run and report: `missing`, `duplicates`, `dead-destinations`, `cross-region`, `silent-resources`, `unqueried-workspaces`, `no-query-auditing` (default: all). Raw scan data in CSV/JSON is unaffected |
 | `--fail-on` | Finding categories that trigger exit code `1` in `--ci` mode; must be active checks (default: `missing,duplicates,dead-destinations`) |
 | `--lookback-days` | Lookback window for workspace usage analysis (default: 30) |
 | `--summary-only` | Omit per-resource detail for healthy/informational sections in HTML and Markdown reports |

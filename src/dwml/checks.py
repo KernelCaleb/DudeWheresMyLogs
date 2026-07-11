@@ -83,6 +83,21 @@ CHECKS = (
         dest_filter=lambda d: d.get("cross_region"),
     ),
     Check(
+        name="silent-resources",
+        title="Configured But Silent",
+        description="Resources shipping to a workspace where none of their data "
+                    "arrived in the lookback window (signal, not proof: an idle "
+                    "resource legitimately emits nothing)",
+        detect=lambda r: any(d.get("silent") for d in r.destinations),
+        default_fail_on=False,
+        severity="warn",
+        row_kind="duplicate",
+        default_open=False,
+        anchor="silent",
+        dest_label="Silent Destination",
+        dest_filter=lambda d: d.get("silent"),
+    ),
+    Check(
         name="unqueried-workspaces",
         title="Unqueried Workspaces",
         description="Workspaces receiving logs that nobody has queried in the lookback window",
