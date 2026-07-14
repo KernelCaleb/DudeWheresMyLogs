@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict
 from datetime import datetime
 
+from . import __version__
 from .checks import get_checks, is_healthy
 from .costs import export_fee_destinations, fmt_usd
 from .diagnostics import has_cross_region, has_dead_destination
@@ -202,7 +203,7 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
     healthy_count = sum(1 for r in results if is_healthy(r, checks))
 
     lines = [
-        "# Azure Diagnostic Settings Audit",
+        "# Azure Log Health Report",
         "",
         f"Generated {timestamp} | {len(subs)} subscription(s) | "
         f"{len(results)} resource(s) evaluated",
@@ -224,6 +225,19 @@ def generate_markdown(results, output, summary_only=False, checks=None, ws_resul
         f"| Errors | {status_counts.get('Error', 0)} |",
         "",
     ])
+
+    md_spend = [ws.est_monthly_total for ws in ws_results
+                if ws.est_monthly_total is not None]
+    md_waste = [r.est_monthly_impact for r in results
+                if r.est_monthly_impact is not None]
+    if md_spend or md_waste:
+        lines.append(
+            f"Estimated monthly log spend: {fmt_usd(sum(md_spend))} across "
+            f"{len(md_spend)} workspace(s) (list-price estimate).")
+        if md_waste:
+            lines.append(
+                f"Estimated monthly waste from findings: {fmt_usd(sum(md_waste))}.")
+        lines.append("")
 
     def _sorted(items):
         return sorted(items, key=lambda r: (
@@ -395,6 +409,7 @@ def _build_dest_index(results):
 
 _CSS = """
 :root {
+  color-scheme: light dark;
   --text: #0f1419;
   --text-soft: #5b6671;
   --text-faint: #8b95a1;
@@ -407,7 +422,26 @@ _CSS = """
   --error-bg: #fef2f2;
   --healthy: #15803d;
   --duplicate: #b45309;
+  --warn-bg: #fdf1e5;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #e2e8ee;
+    --text-soft: #9aa7b4;
+    --text-faint: #66727e;
+    --rule: #2a323a;
+    --rule-soft: #212830;
+    --bg: #14181d;
+    --bg-soft: #1a2026;
+    --accent: #e8944f;
+    --error: #f08080;
+    --error-bg: #2b1a1a;
+    --healthy: #58c07a;
+    --duplicate: #d9a03f;
+    --warn-bg: #33261a;
+  }
 }
 
 * { box-sizing: border-box; }
@@ -740,7 +774,7 @@ body {
   border-radius: 2px;
   font-weight: 500;
 }
-.la-tag.tag-warn { background: #fdf1e5; color: var(--accent); }
+.la-tag.tag-warn { background: var(--warn-bg); color: var(--accent); }
 
 /* Inline status text */
 .t-error { color: var(--error); font-weight: 500; }
@@ -799,8 +833,14 @@ body {
   font-family: var(--mono);
 }
 
-/* Print */
+/* Print (always light) */
 @media print {
+  :root {
+    --text: #0f1419; --text-soft: #5b6671; --text-faint: #8b95a1;
+    --rule: #e1e6eb; --rule-soft: #eef1f4; --bg: #ffffff; --bg-soft: #fafbfc;
+    --accent: #b54708; --error: #991b1b; --error-bg: #fef2f2;
+    --healthy: #15803d; --duplicate: #b45309; --warn-bg: #fdf1e5;
+  }
   body { font-size: 11px; color: #000; }
   .report { padding: 12px 0 24px; max-width: none; }
   .row, .rg, .section, .dest { break-inside: avoid; }
@@ -1339,15 +1379,16 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Diagnostic Settings Audit &middot; DudeWheresMyLogs</title>
+<meta name="generator" content="DudeWheresMyLogs {__version__}">
+<title>Azure Log Health Report &middot; DudeWheresMyLogs</title>
 <style>{_CSS}</style>
 </head>
 <body>
 <div class="report">
 
 <header class="hd">
-  <div class="doc-class">DudeWheresMyLogs &middot; audit report</div>
-  <h1>Azure Diagnostic Settings Audit</h1>
+  <div class="doc-class">DudeWheresMyLogs &middot; log health report</div>
+  <h1>Azure Log Health Report</h1>
   <div class="meta">
     Generated <strong>{timestamp}</strong>
     <span class="meta-sep">&middot;</span>
@@ -1370,7 +1411,7 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
 {sections_html}
 
 <footer class="footer">
-  <span>DudeWheresMyLogs &middot; Azure Diagnostic Logging Audit</span>
+  <span>DudeWheresMyLogs {__version__} &middot; Azure Log Health</span>
   <span>{timestamp}</span>
 </footer>
 

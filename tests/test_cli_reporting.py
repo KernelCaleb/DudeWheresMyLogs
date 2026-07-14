@@ -546,5 +546,162 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("details omitted (summary-only)", content)
 
 
+class TermTests(unittest.TestCase):
+    def test_paint_disabled_is_passthrough(self):
+        from dwml.term import paint
+        self.assertEqual(paint("hello", "bold", "red", enabled=False), "hello")
+        self.assertEqual(paint("hello", enabled=True), "hello")
+
+    def test_paint_enabled_wraps_in_ansi(self):
+        from dwml.term import paint
+        self.assertEqual(paint("x", "bold", enabled=True), "\x1b[1mx\x1b[0m")
+        self.assertEqual(paint("x", "bold", "red", enabled=True), "\x1b[1;31mx\x1b[0m")
+
+    def test_fmt_elapsed(self):
+        from dwml.term import fmt_elapsed
+        self.assertEqual(fmt_elapsed(42), "42s")
+        self.assertEqual(fmt_elapsed(187), "3m 07s")
+        self.assertEqual(fmt_elapsed(3725), "1h 02m")
+
+    def test_supports_color_respects_no_color_and_tty(self):
+        import os
+        from unittest import mock
+        from dwml.term import supports_color
+        tty = SimpleNamespace(isatty=lambda: True)
+        pipe = SimpleNamespace(isatty=lambda: False)
+        clean_env = {k: v for k, v in os.environ.items()
+                     if k not in ("NO_COLOR", "FORCE_COLOR", "TERM")}
+        with mock.patch.dict(os.environ, clean_env, clear=True):
+            self.assertTrue(supports_color(tty))
+            self.assertFalse(supports_color(pipe))
+        with mock.patch.dict(os.environ, {**clean_env, "NO_COLOR": ""}, clear=True):
+            self.assertFalse(supports_color(tty))
+        with mock.patch.dict(os.environ, {**clean_env, "FORCE_COLOR": "1"}, clear=True):
+            self.assertTrue(supports_color(pipe))
+
+
+class DiffTests(unittest.TestCase):
+    def _payload(self, results, ws_results=None, sub_audits=None):
+        from dwml.reporting import build_payload
+        return build_payload(results, ws_results=ws_results, sub_audits=sub_audits)
+
+    def _missing(self, name):
+        r = _result("Missing")
+        r.resource_id = f"/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.Example/type/{name}"
+        r.resource_name = name
+        return r
+
+    def test_load_payload_from_json_and_html(self):
+        from dwml.diffing import load_payload
+        results = [self._missing("kv-1")]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            json_out = Path(tmp_dir) / "r.json"
+            html_out = Path(tmp_dir) / "r.html"
+            generate_json(results, str(json_out))
+            generate_html(results, str(html_out))
+            from_json = load_payload(str(json_out))
+            from_html = load_payload(str(html_out))
+
+        self.assertEqual(from_json["summary"]["total_resources"], 1)
+        self.assertEqual(from_html["summary"]["total_resources"], 1)
+        self.assertEqual(from_json["results"][0]["resource_name"], "kv-1")
+
+    def test_load_payload_rejects_foreign_files(self):
+        from dwml.diffing import load_payload
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            other = Path(tmp_dir) / "other.html"
+            other.write_text("<html><body>hello</body></html>", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_payload(str(other))
+
+    def test_compute_diff_added_and_resolved(self):
+        from dwml.diffing import compute_diff, diff_has_changes
+        old = self._payload([self._missing("kv-old"), self._missing("kv-both")])
+        new = self._payload([self._missing("kv-both"), self._missing("kv-new"),
+                             _result(duplicate=True)])
+        diff = compute_diff(old, new)
+
+        missing = diff["checks"]["missing"]
+        self.assertEqual(missing["old_count"], 2)
+        self.assertEqual(missing["new_count"], 2)
+        self.assertEqual([i["name"] for i in missing["added"]], ["kv-new"])
+        self.assertEqual([i["name"] for i in missing["resolved"]], ["kv-old"])
+        self.assertEqual(len(diff["checks"]["duplicates"]["added"]), 1)
+        self.assertTrue(diff_has_changes(diff))
+        # Workspace analysis missing from both payloads: not comparable
+        self.assertIn("unqueried-workspaces", diff["skipped"])
+
+    def test_compute_diff_no_changes(self):
+        from dwml.diffing import compute_diff, diff_has_changes
+        payload = self._payload([self._missing("kv-1")])
+        diff = compute_diff(payload, payload)
+        self.assertFalse(diff_has_changes(diff))
+
+    def test_compute_diff_workspace_and_cost_delta(self):
+        from dwml.diffing import compute_diff
+        ws_old = _workspace(audit=True, queries=5)
+        ws_new = _workspace(audit=True, queries=0)
+        ws_old.est_monthly_total = 10.0
+        ws_new.est_monthly_total = 14.5
+        old = self._payload([_result()], ws_results=[ws_old])
+        new = self._payload([_result()], ws_results=[ws_new])
+        diff = compute_diff(old, new)
+
+        unqueried = diff["checks"]["unqueried-workspaces"]
+        self.assertEqual([i["name"] for i in unqueried["added"]], ["law-1"])
+        self.assertNotIn("unqueried-workspaces", diff["skipped"])
+        self.assertEqual(diff["costs"]["est_monthly_spend_usd"]["old"], 10.0)
+        self.assertEqual(diff["costs"]["est_monthly_spend_usd"]["new"], 14.5)
+
+    def test_renderers_and_exit_codes(self):
+        from dwml.diffing import run_diff
+        old_results = [self._missing("kv-old")]
+        new_results = [self._missing("kv-old"), self._missing("kv-new")]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            old_path = Path(tmp_dir) / "old.json"
+            new_path = Path(tmp_dir) / "new.json"
+            generate_json(old_results, str(old_path))
+            generate_json(new_results, str(new_path))
+
+            md_out = Path(tmp_dir) / "diff.md"
+            self.assertEqual(run_diff([str(old_path), str(new_path),
+                                       "-f", "md", "-o", str(md_out)]), 0)
+            md_content = md_out.read_text(encoding="utf-8")
+
+            json_out = Path(tmp_dir) / "diff.json"
+            self.assertEqual(run_diff([str(old_path), str(new_path), "--ci",
+                                       "-f", "json", "-o", str(json_out)]), 1)
+            diff_payload = json.loads(json_out.read_text(encoding="utf-8"))
+
+            # New finding outside --fail-on categories does not fail CI
+            self.assertEqual(run_diff([str(old_path), str(new_path), "--ci",
+                                       "--fail-on", "duplicates",
+                                       "-f", "json", "-o", str(json_out)]), 0)
+            # Identical reports: clean
+            self.assertEqual(run_diff([str(new_path), str(new_path), "--ci",
+                                       "-f", "json", "-o", str(json_out)]), 0)
+            # Unreadable input: operational error
+            self.assertEqual(run_diff([str(old_path),
+                                       str(Path(tmp_dir) / "nope.json"),
+                                       "-f", "json", "-o", str(json_out)]), 2)
+
+        self.assertIn("# Log Health Report Diff", md_content)
+        self.assertIn("**New:** kv-new", md_content)
+        self.assertEqual(
+            [i["name"] for i in diff_payload["checks"]["missing"]["added"]],
+            ["kv-new"])
+
+    def test_render_text_marks_changes(self):
+        from dwml.diffing import compute_diff, render_text
+        old = self._payload([self._missing("kv-old")])
+        new = self._payload([self._missing("kv-new")])
+        text = render_text(compute_diff(old, new), color=False)
+        self.assertIn("+ kv-new", text)
+        self.assertIn("- kv-old", text)
+        self.assertIn("1 new finding(s), 1 resolved.", text)
+        clean = render_text(compute_diff(old, old), color=False)
+        self.assertIn("No finding changes.", clean)
+
+
 if __name__ == "__main__":
     unittest.main()

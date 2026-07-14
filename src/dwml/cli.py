@@ -6,6 +6,7 @@ from collections import Counter
 from . import __version__
 from .checks import CHECK_NAMES, DEFAULT_FAIL_ON, get_check, get_checks
 from .reporting import generate_report
+from .term import Console
 
 
 def _positive_int(value):
@@ -20,8 +21,11 @@ def build_parser():
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
         prog="DudeWheresMyLogs",
-        description="Azure diagnostic logging auditor - find missing logs, "
-                    "duplicate log shipping, and wasted spend.",
+        description="Azure log health auditor - is logging configured, "
+                    "flowing, used, and worth the money?",
+        epilog="To compare two saved reports: "
+               "DudeWheresMyLogs diff OLD NEW (JSON or HTML reports, "
+               "see DudeWheresMyLogs diff --help).",
     )
     sub_group = parser.add_mutually_exclusive_group()
     sub_group.add_argument(
@@ -253,8 +257,17 @@ def select_subscriptions_interactive(subscriptions):
         print("Invalid selection. Try again.")
 
 
+_SEVERITY_COLORS = {"warn": "yellow", "dup": "yellow", "err": "red"}
+
+
 def run(argv=None):
     """Run DudeWheresMyLogs and return a process exit code."""
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "diff":
+        from .diffing import run_diff
+        return run_diff(argv[1:])
+
     parser = build_parser()
     args = parser.parse_args(argv)
     active_checks = _parse_checks(args.checks, parser)
@@ -263,23 +276,24 @@ def run(argv=None):
     from .azure import get_credential, list_resources, list_subscriptions
     from .diagnostics import check_all_diagnostics
 
-    print(f"DudeWheresMyLogs v{__version__}")
-    print("Azure Diagnostic Logging Auditor\n")
+    console = Console()
+    console.banner("DudeWheresMyLogs", __version__,
+                   "Azure log health: configured, flowing, used, worth it")
 
-    # Authenticate
+    console.phase("Authenticating")
     credential = get_credential()
-    print("Authenticated successfully.\n")
+    console.info("Credential validated.")
 
     # Resolve subscriptions. In CI mode an empty subscription list is an
     # operational error (exit 2), not a findings result (exit 1).
     all_subs = list_subscriptions(credential)
     if not all_subs:
-        print("No subscriptions found.")
+        console.error("No subscriptions found.")
         return 2 if args.ci else 1
 
     if args.all_subs:
         selected = all_subs
-        print(f"Scanning all {len(selected)} subscriptions.\n")
+        console.info(f"Scanning all {len(selected)} subscription(s).")
     elif args.subscription:
         sub_map = {s["id"].lower(): s for s in all_subs}
         selected = []
@@ -287,9 +301,9 @@ def run(argv=None):
             if sid.lower() in sub_map:
                 selected.append(sub_map[sid.lower()])
             else:
-                print(f"Warning: subscription {sid} not found or not accessible, skipping.")
+                console.warn(f"Subscription {sid} not found or not accessible, skipping.")
         if not selected:
-            print("No valid subscriptions to scan.")
+            console.error("No valid subscriptions to scan.")
             return 2 if args.ci else 1
     else:
         selected = select_subscriptions_interactive(all_subs)
@@ -300,14 +314,12 @@ def run(argv=None):
     audit_activity_log = "no-activity-log-export" in active_checks
 
     for sub in selected:
-        print(f"Scanning subscription: {sub['name']} ({sub['id']})")
+        console.phase(f"Scanning {sub['name']}", sub["id"])
 
         if audit_activity_log:
             from .tenant import audit_subscription
             sub_audits.append(audit_subscription(credential, sub["id"], sub["name"]))
 
-        sys.stderr.write("Enumerating resources... ")
-        sys.stderr.flush()
         resources = list_resources(credential, sub["id"])
         total_resources = len(resources)
         resources = filter_resources(
@@ -316,11 +328,11 @@ def run(argv=None):
             exclude_types=args.exclude_types,
             resource_groups=args.resource_group,
         )
-        sys.stderr.write(f"found {total_resources} resources, scanning {len(resources)} after filters.\n")
-        sys.stderr.flush()
+        console.info(f"Found {total_resources} resource(s), "
+                     f"scanning {len(resources)} after filters.")
 
         if not resources:
-            print("  No resources found, skipping.\n")
+            console.info("No resources to scan, skipping.")
             continue
 
         results = check_all_diagnostics(
@@ -328,10 +340,9 @@ def run(argv=None):
             max_workers=args.workers,
         )
         all_results.extend(results)
-        print()
 
     if not all_results and not sub_audits:
-        print("No results to report.")
+        console.print("\nNo results to report.")
         return 0
 
     # Workspace usage analysis: needed by workspace-scope checks and by the
@@ -342,6 +353,8 @@ def run(argv=None):
         or "silent-resources" in active_checks
     )
     if needs_ws_analysis:
+        console.phase("Analyzing destination workspaces",
+                      f"{args.lookback_days}-day lookback")
         from .costs import estimate_costs, load_prices
         from .workspaces import analyze_workspaces, flag_silent_resources
         ws_results, seen_map = analyze_workspaces(
@@ -353,7 +366,7 @@ def run(argv=None):
         try:
             prices = load_prices(args.price_file)
         except (OSError, ValueError) as e:
-            print(f"Warning: could not load price file: {e}; skipping cost estimates.")
+            console.warn(f"Could not load price file: {e}; skipping cost estimates.")
             prices = None
         if prices:
             estimate_costs(all_results, ws_results, seen_map, prices)
@@ -361,30 +374,40 @@ def run(argv=None):
     # Print summary
     status_counts = Counter(r.status for r in all_results)
 
-    print("--- Summary ---")
-    print(f"  {'Total entries:':<24}{len(all_results)}")
-    print(f"  {'Enabled:':<24}{status_counts.get('Enabled', 0)}")
+    console.phase("Summary")
+
+    def summary_row(label, count, style=None):
+        value = str(count)
+        if count and style:
+            value = console.paint(value, style)
+        elif not count:
+            value = console.paint(value, "dim")
+        console.info(f"{label + ':':<26}{value}")
+
+    summary_row("Total entries", len(all_results))
+    summary_row("Enabled", status_counts.get("Enabled", 0), "green")
     for check in get_checks(active_checks, scope="resource"):
         count = sum(1 for r in all_results if check.detect(r))
-        print(f"  {check.title + ':':<24}{count}")
+        summary_row(check.title, count, _SEVERITY_COLORS.get(check.severity))
     for check in get_checks(active_checks, scope="workspace"):
         count = sum(1 for ws in ws_results if check.detect(ws))
-        print(f"  {check.title + ':':<24}{count}")
+        summary_row(check.title, count, _SEVERITY_COLORS.get(check.severity))
     for check in get_checks(active_checks, scope="subscription"):
         count = sum(1 for s in sub_audits if check.detect(s))
-        print(f"  {check.title + ':':<24}{count}")
-    print(f"  {'Not Supported:':<24}{status_counts.get('Not Supported', 0)}")
-    print(f"  {'Errors:':<24}{status_counts.get('Error', 0)}")
+        summary_row(check.title, count, _SEVERITY_COLORS.get(check.severity))
+    summary_row("Not Supported", status_counts.get("Not Supported", 0))
+    summary_row("Errors", status_counts.get("Error", 0), "red")
 
     spend = [ws.est_monthly_total for ws in ws_results if ws.est_monthly_total is not None]
     waste = [r.est_monthly_impact for r in all_results if r.est_monthly_impact is not None]
     if spend or waste:
         from .costs import fmt_usd
-        print(f"  {'Est. monthly spend:':<24}{fmt_usd(sum(spend))} "
-              f"across {len(spend)} workspace(s) (list-price estimate)")
+        console.info(f"{'Est. monthly spend:':<26}{fmt_usd(sum(spend))} "
+                     f"across {len(spend)} workspace(s) (list-price estimate)")
         if waste:
-            print(f"  {'Est. monthly waste:':<24}{fmt_usd(sum(waste))} "
-                  f"from {len(waste)} finding(s)")
+            console.info(f"{'Est. monthly waste:':<26}"
+                         f"{console.paint(fmt_usd(sum(waste)), 'yellow')} "
+                         f"from {len(waste)} finding(s)")
 
     # Generate report
     output_path = generate_report(
@@ -392,7 +415,8 @@ def run(argv=None):
         summary_only=args.summary_only, checks=active_checks,
         ws_results=ws_results, sub_audits=sub_audits,
     )
-    print(f"\nReport saved to: {output_path}")
+    console.print(f"\nReport saved to: {console.paint(output_path, 'bold')}")
+    console.print(console.paint(f"Done in {console.elapsed()}.", "dim"))
     return _determine_exit_code(all_results, ci_mode=args.ci, fail_on=fail_on,
                                 ws_results=ws_results, sub_audits=sub_audits)
 

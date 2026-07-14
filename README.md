@@ -1,33 +1,44 @@
 # DudeWheresMyLogs
 
-## Overview
-DudeWheresMyLogs is a Python CLI tool that audits Azure diagnostic logging configurations across subscriptions. It finds resources missing diagnostic settings, detects duplicate log shipping, and shows where logs are being sent -- helping organizations cut wasted spend on redundant logging.
+An Azure log health tool. One scan answers the four questions every cloud security and platform team eventually asks about their logging pipeline:
 
-## Features
-- Scan all resources across one or more Azure subscriptions
-- Identify resources without diagnostic logging enabled
-- Detect duplicate log shipping (same destination type sending to two or more different destinations)
-- Detect dead destinations (diagnostic settings still shipping logs to deleted workspaces, storage accounts, or event hubs)
-- Flag cross-region log shipping (egress cost and data-residency concern)
-- Workspace usage analysis: flag destination workspaces nobody has queried in the lookback window, and workspaces where query auditing is disabled so usage cannot be assessed (needs Log Analytics Reader on the workspaces; degrades gracefully without it)
-- Ingestion liveness reconciliation: compare resources *configured* to ship against the `_ResourceId`s actually present in each workspace, flagging "configured but silent" pipelines (advisory: an idle resource legitimately emits nothing)
-- Activity Log export audit: flag subscriptions whose control-plane audit trail is not exported anywhere (Azure keeps it only 90 days; export to Log Analytics is free)
-- Cost estimates: estimated monthly spend per workspace (ingestion by table plan, Sentinel-aware rates, retention overage) and estimated monthly waste per finding (redundant duplicate flows, cross-region bandwidth), from a configurable list-price table (`--price-file`); flags destinations subject to the platform log export fee billed since June 2026. All figures are estimates, not bills
-- Map log destinations (Log Analytics, Storage Accounts, Event Hubs, Partner Solutions)
-- Storage account sub-service scanning (blob, queue, table, file)
-- Parallel scanning with configurable worker count
-- Retry with exponential backoff for Azure ARM throttling (enterprise-scale ready)
-- HTML audit report with numbered sections, collapsible groupings, in-page anchor links, and an embedded machine-readable JSON payload
-- CSV export for further analysis
-- Markdown export for pasting findings into tickets, PRs, and chat
-- JSON export for automation, diffing, and CI workflows
-- Resource filtering by type and resource group
-- CI mode with meaningful exit codes and configurable finding categories (`--fail-on`)
+1. **Configured?** Which resources have no diagnostic settings at all, which subscriptions never export their Activity Log, and which settings still ship to destinations that no longer exist.
+2. **Flowing?** Which resources are configured to ship logs but whose data never actually arrives at the workspace.
+3. **Used?** Which destination workspaces nobody has queried in the last month -- logs paid for and read by no one.
+4. **Worth it?** What each workspace costs per month, and what redundant or misrouted shipping is wasting, in dollars.
+
+Organizations routinely pay for logs shipped twice, logs shipped to deleted workspaces, and workspaces no human or detection rule ever reads. DudeWheresMyLogs finds all of it in one pass and puts a list-price dollar figure on the waste.
+
+## Checks
+
+| Check | Question | Fails CI by default |
+|---|---|---|
+| `missing` | Resources with no diagnostic settings | Yes |
+| `duplicates` | Same destination type shipping to two or more different destinations | Yes |
+| `dead-destinations` | Settings shipping to deleted workspaces/storage/event hubs | Yes |
+| `no-activity-log-export` | Subscriptions whose control-plane audit trail is exported nowhere (Azure keeps it only 90 days; export to Log Analytics is free) | Yes |
+| `cross-region` | Destination region differs from resource region (egress cost, data residency) | No |
+| `silent-resources` | Configured to ship, but no data arrived in the lookback window | No (advisory) |
+| `unqueried-workspaces` | Workspaces receiving logs that nobody queried in the lookback window | No |
+| `no-query-auditing` | Workspaces where query auditing is off, so usage cannot be assessed | No |
+
+On top of the checks, every scan maps where logs are going (Log Analytics, Storage, Event Hubs, Partner Solutions) and estimates costs: per-workspace monthly ingestion (by table plan, Sentinel-aware) and retention overage, per-finding monthly waste (redundant duplicate flows, cross-region bandwidth), and destinations subject to the platform log export fee billed since June 2026. All figures are list-price estimates from a configurable price table (`--price-file`), not bills.
+
+## Highlights
+
+- Azure SDK native (no `az` CLI dependency), parallel scanning, automatic retry/backoff on ARM throttling -- built for enterprise-scale tenants
+- Graceful degradation everywhere: whatever the credential cannot see is reported as unknown, never guessed and never fatal to the scan
+- Self-contained HTML report (light and dark mode) with collapsible findings, a destination map, and the full machine-readable payload embedded inside
+- `diff` subcommand: compare any two saved reports -- JSON or HTML, in any combination -- and see new findings, resolved findings, and cost deltas
+- CI mode with meaningful exit codes and per-category `--fail-on` control, for scheduled scans that alert only on what you care about
+- CSV, JSON, and Markdown exports for analysis, automation, and pasting findings into tickets
+- Clean terminal output: progress bars and colors on a TTY, plain text in CI (`NO_COLOR` respected)
 
 ## Prerequisites
+
 - Python 3.9+
-- ARM `Reader` on the scanned subscriptions. Workspace usage analysis additionally needs data-plane query access on destination workspaces (`Log Analytics Reader`); without it those workspaces report as unknown rather than failing the scan
-- Azure credentials (any method supported by [DefaultAzureCredential](https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity.defaultazurecredential))
+- ARM `Reader` on the scanned subscriptions. Workspace usage, liveness, and cost analysis additionally need data-plane query access on destination workspaces (`Log Analytics Reader`); without it those workspaces report as unknown rather than failing the scan
+- Azure credentials via any method supported by [DefaultAzureCredential](https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity.defaultazurecredential):
   - `az login` (Azure CLI)
   - Managed Identity (VMs, App Service, etc.)
   - Service Principal via environment variables (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`)
@@ -51,6 +62,8 @@ pip install -e .
 
 ## Usage
 
+### Scanning
+
 ```bash
 # Interactive mode -- pick one or more subscriptions from a list (e.g. 0,2,5)
 DudeWheresMyLogs
@@ -70,21 +83,42 @@ DudeWheresMyLogs -f md
 # Specify output file
 DudeWheresMyLogs -o report.html
 
-# Adjust parallel workers (default: 10)
-DudeWheresMyLogs -w 20
-
 # Scope the scan to specific resources
 DudeWheresMyLogs --include-types "Microsoft.KeyVault/*" --resource-group "prod-*"
 
-# Use CI-friendly exit codes: 0=clean, 1=findings, 2=errors
+# Longer usage lookback window (default 30 days)
+DudeWheresMyLogs --lookback-days 90
+```
+
+### Scheduled / CI scans
+
+```bash
+# CI-friendly exit codes: 0=clean, 1=findings, 2=errors
 DudeWheresMyLogs -a --ci
 
-# Choose which finding categories fail a CI scan
+# Choose which finding categories fail the scan
 DudeWheresMyLogs -a --ci --fail-on duplicates,dead-destinations
 
 # Keep reports small in large tenants: counts only for healthy/informational
 DudeWheresMyLogs -a --summary-only
 ```
+
+### Diffing reports
+
+Every JSON report -- and every HTML report, which embeds the same payload -- can be compared against any later one without re-scanning:
+
+```bash
+# What changed since last week's scan? (JSON or HTML, in any combination)
+DudeWheresMyLogs diff last-week.json today.html
+
+# Markdown diff for a ticket or PR comment
+DudeWheresMyLogs diff old.json new.json -f md -o diff.md
+
+# CI regression gate: exit 1 only when NEW findings appeared
+DudeWheresMyLogs diff old.json new.json --ci --fail-on missing,dead-destinations
+```
+
+The diff shows per-check counts, which findings are new, which were resolved, and how estimated monthly spend and waste moved.
 
 ### Options
 
@@ -99,12 +133,14 @@ DudeWheresMyLogs -a --summary-only
 | `--exclude-types` | Skip matching resource types (supports wildcards, repeatable) |
 | `--resource-group` | Only scan matching resource groups (supports wildcards, repeatable) |
 | `--ci` | Return `0` for clean, `1` for findings, `2` for scan errors |
-| `--checks` | Which finding checks to run and report: `missing`, `duplicates`, `dead-destinations`, `cross-region`, `silent-resources`, `unqueried-workspaces`, `no-query-auditing`, `no-activity-log-export` (default: all). Raw scan data in CSV/JSON is unaffected |
+| `--checks` | Which checks to run and report (see the Checks table; default: all). Raw scan data in CSV/JSON is unaffected |
 | `--fail-on` | Finding categories that trigger exit code `1` in `--ci` mode; must be active checks (default: `missing,duplicates,dead-destinations,no-activity-log-export`) |
 | `--lookback-days` | Lookback window for workspace usage analysis (default: 30) |
 | `--price-file` | JSON price table overriding the built-in East US list prices used for cost estimates |
 | `--summary-only` | Omit per-resource detail for healthy/informational sections in HTML and Markdown reports |
 | `--version` | Show version and exit |
+
+`DudeWheresMyLogs diff` takes its own options: `-f text|md|json`, `-o FILE`, `--ci`, and `--fail-on` (see `DudeWheresMyLogs diff --help`).
 
 ### Tips for large environments
 - Use `-w 20` (or higher) to increase parallelism when scanning thousands of resources. Stay at or below 20 to avoid excessive ARM throttling.
@@ -112,10 +148,17 @@ DudeWheresMyLogs -a --summary-only
 - Subscriptions are scanned sequentially, which naturally spreads API load across subscription-level throttle buckets.
 
 ## Output
-- **HTML report** (default): Self-contained file with a findings overview, scope block, and seven numbered sections (Missing Diagnostics, Duplicate Shipping, Dead Destinations, Cross-Region Shipping, Healthy Resources, Informational, Destination Map). Findings are grouped by subscription and resource group; each resource expands inline to show its full ID, configured destinations, and log categories. Sections have stable anchor IDs (`#missing`, `#duplicate`, `#dead`, `#cross-region`, `#healthy`, `#informational`, `#destinations`) for sharing direct links. The full machine-readable payload is embedded in a `<script type="application/json" id="dwml-data">` block, so any saved report can be re-parsed or diffed later without re-scanning.
-- **CSV report** (`-f csv`): Flat export with subscription, resource, status, destination, duplicate, dead destination, and cross-region columns.
-- **JSON report** (`-f json`): Structured export with summary metadata and full per-resource detail for automation and comparisons.
-- **Markdown report** (`-f md`): Findings-focused tables (missing, duplicates, dead destinations, cross-region) ready to paste into tickets, PRs, or chat.
+
+- **HTML report** (default): Self-contained file -- inline CSS, no external dependencies, automatic light/dark mode. A findings overview links to numbered collapsible sections for each active check, followed by Healthy Resources, Informational, Activity Log Export, Workspace Usage (with per-workspace cost estimates), and a Destination Map showing every destination and the resources streaming to it, ordered by impact. Each resource expands inline to its full ID, per-setting destinations, categories, and estimated waste. The full machine-readable payload is embedded in a `<script type="application/json" id="dwml-data">` block, so any saved report can be re-parsed or diffed later without re-scanning.
+- **JSON report** (`-f json`): The same structured payload as a standalone file, for automation, diffing, and CI.
+- **Markdown report** (`-f md`): Findings-focused tables ready to paste into tickets, PRs, or chat, including workspace usage and cost estimates.
+- **CSV report** (`-f csv`): Flat per-resource export for spreadsheet analysis.
+
+## How the deeper checks work
+
+- **Ingestion liveness** (`silent-resources`): per destination workspace, the tool queries which `_ResourceId`s actually landed data in the lookback window and reconciles that against what is configured to ship there. A silent pipeline is a signal, not proof -- an idle resource legitimately emits nothing.
+- **Workspace usage** (`unqueried-workspaces`): query counts come from the workspace's `LAQueryLogs` audit table. The tool's own queries carry a self-identifying marker and exclude themselves, so scheduled scans never make a workspace look "used". Workspaces without query auditing are reported as unassessable (`no-query-auditing`) rather than guessed at.
+- **Cost estimates**: ingestion is priced per table plan (Analytics/Basic/Auxiliary), with Sentinel-enabled workspaces priced at the combined rate and given Sentinel's longer free retention window. Duplicate-shipping waste keeps the largest flow and counts the rest as redundant. Cross-region waste uses inter-continental bandwidth rates. Prices ship in `prices.json` (US East list prices) and can be overridden with `--price-file`.
 
 ## License
 MIT

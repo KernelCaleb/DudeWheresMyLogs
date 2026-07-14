@@ -16,6 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - keeps unit tests importable wi
     MonitorManagementClient = None
 
 from .azure import _resource_group_from_id, _retry_policy_kwargs
+from .term import Progress
 
 
 @dataclass
@@ -428,18 +429,12 @@ def check_all_diagnostics(credential, subscription_id, subscription_name, resour
     """
     all_results = []
     total = len(resources)
-    completed = 0
     lock = threading.Lock()
+    bar = Progress(total, "Checking diagnostics")
 
     def progress(resource_name):
-        nonlocal completed
         with lock:
-            completed += 1
-            sys.stderr.write(
-                f"\r[{completed:>{len(str(total))}}/{total}] "
-                f"Checking diagnostics... {resource_name[:60]:<60}"
-            )
-            sys.stderr.flush()
+            bar.update(resource_name)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_resource = {
@@ -469,9 +464,7 @@ def check_all_diagnostics(credential, subscription_id, subscription_name, resour
                 ))
             progress(resource["name"])
 
-    # Clear the progress line
-    sys.stderr.write("\r" + " " * 80 + "\r")
-    sys.stderr.flush()
+    bar.finish()
 
     # Resolve destination resource regions and derive findings from them
     sys.stderr.write("Resolving destination resource regions...\n")
