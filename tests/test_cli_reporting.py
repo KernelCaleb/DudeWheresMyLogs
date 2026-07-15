@@ -703,5 +703,287 @@ class DiffTests(unittest.TestCase):
         self.assertIn("No finding changes.", clean)
 
 
+_POLICY_YAML = """\
+version: 1
+rules:
+  - name: kv-audit-to-la
+    title: Key Vaults must ship AuditEvent to Log Analytics
+    severity: fail
+    match: { type: "Microsoft.KeyVault/*" }
+    require:
+      categories: ["AuditEvent"]
+      destination_type: "Log Analytics"
+  - name: no-legacy-tables
+    severity: warn
+    match: { type: "*" }
+    forbid: { la_destination_type: "AzureDiagnostics" }
+  - name: ws-retention-90
+    severity: warn
+    scope: workspace
+    require: { retention_days_at_least: 90 }
+"""
+
+
+def _kv_result(name="kv-1", status="Enabled", destinations=None, duplicate=False):
+    r = _result(status=status, destinations=destinations or [], duplicate=duplicate)
+    r.resource_type = "Microsoft.KeyVault/vaults"
+    r.resource_id = (
+        f"/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/{name}")
+    r.resource_name = name
+    return r
+
+
+def _la_dest(categories=(), la_type="", region="eastus", silent=None, wid=WORKSPACE_A):
+    d = {"setting_name": "s", "type": "Log Analytics", "name": "law",
+         "id": wid, "log_categories": list(categories),
+         "la_destination_type": la_type, "region": region, "not_found": False}
+    if silent is not None:
+        d["silent"] = silent
+    return d
+
+
+class PolicyLoadTests(unittest.TestCase):
+    def _write(self, content, suffix=".yaml"):
+        f = tempfile.NamedTemporaryFile(
+            "w", suffix=suffix, delete=False, encoding="utf-8")
+        f.write(content)
+        f.close()
+        self.addCleanup(Path(f.name).unlink)
+        return f.name
+
+    def test_loads_yaml_and_json(self):
+        from dwml.policy import load_policy
+        rules = load_policy(self._write(_POLICY_YAML))
+        self.assertEqual([r.name for r in rules],
+                         ["kv-audit-to-la", "no-legacy-tables", "ws-retention-90"])
+        self.assertEqual(rules[0].severity, "fail")
+        self.assertEqual(rules[2].scope, "workspace")
+
+        json_policy = json.dumps({"rules": [
+            {"name": "j-rule", "require": {"diagnostics": True}}]})
+        rules = load_policy(self._write(json_policy, suffix=".json"))
+        self.assertEqual(rules[0].severity, "fail")  # default
+
+    def test_validation_errors(self):
+        from dwml.policy import PolicyError, load_policy
+        cases = [
+            "rules:\n  - severity: fail\n    require: {diagnostics: true}",  # no name
+            "rules:\n  - name: x\n    severity: bogus\n    require: {diagnostics: true}",
+            "rules:\n  - name: x\n    require: {nonsense: true}",
+            "rules:\n  - name: x\n    match: {type: '*'}",  # no require/forbid
+            "rules:\n  - name: x\n    require: {diagnostics: true}\n"
+            "  - name: x\n    require: {diagnostics: true}",  # duplicate
+            "rules:\n  - name: x\n    scope: workspace\n    forbid: {silent: true}",
+        ]
+        for content in cases:
+            with self.assertRaises(PolicyError, msg=content):
+                load_policy(self._write(content))
+
+    def test_baseline_policy_ships_valid(self):
+        from dwml.policy import load_policy
+        baseline = Path(__file__).parent.parent / "policies" / "baseline.yaml"
+        rules = load_policy(str(baseline))
+        self.assertGreaterEqual(len(rules), 5)
+
+
+class PolicyEvaluationTests(unittest.TestCase):
+    def _evaluate(self, yaml_rules, results, ws_results=()):
+        import yaml as yaml_mod
+        from dwml.policy import _validate_rule, evaluate_policy
+        raw = yaml_mod.safe_load(yaml_rules)["rules"]
+        rules = []
+        seen = set()
+        for i, r in enumerate(raw):
+            rule = _validate_rule(r, i, seen)
+            seen.add(rule.name)
+            rules.append(rule)
+        evaluate_policy(rules, list(results), list(ws_results))
+        return rules
+
+    def test_require_categories_and_destination(self):
+        good = _kv_result("kv-good", destinations=[_la_dest(["AuditEvent"])])
+        alllogs = _kv_result("kv-alllogs", destinations=[_la_dest(["allLogs"])])
+        wrong_cat = _kv_result("kv-nocat", destinations=[_la_dest(["Other"])])
+        storage_only = _kv_result("kv-stg", destinations=[{
+            "setting_name": "s", "type": "Storage Account", "name": "stg",
+            "id": STORAGE_A, "log_categories": ["AuditEvent"],
+            "la_destination_type": "", "region": "eastus", "not_found": False}])
+        missing = _kv_result("kv-missing", status="Missing")
+        unmatched = _result()  # not a Key Vault
+
+        self._evaluate(_POLICY_YAML, [good, alllogs, wrong_cat, storage_only,
+                                      missing, unmatched])
+        self.assertEqual(good.policy_violations, [])
+        self.assertEqual(alllogs.policy_violations, [])
+        self.assertEqual(wrong_cat.policy_violations, ["kv-audit-to-la"])
+        self.assertEqual(storage_only.policy_violations, ["kv-audit-to-la"])
+        self.assertEqual(missing.policy_violations, ["kv-audit-to-la"])
+        self.assertEqual(unmatched.policy_violations, [])
+
+    def test_forbid_la_destination_type(self):
+        legacy = _result(destinations=[_la_dest(["X"], la_type="AzureDiagnostics")])
+        dedicated = _result(destinations=[_la_dest(["X"], la_type="Dedicated")])
+        unknown_mode = _result(destinations=[_la_dest(["X"], la_type="")])
+        self._evaluate(_POLICY_YAML, [legacy, dedicated, unknown_mode])
+        self.assertIn("no-legacy-tables", legacy.policy_violations)
+        self.assertEqual(dedicated.policy_violations, [])
+        self.assertEqual(unknown_mode.policy_violations, [])
+
+    def test_require_flowing_unknown_never_violates(self):
+        rules = """
+rules:
+  - name: must-flow
+    require: { flowing: true }
+"""
+        silent = _result(destinations=[_la_dest(["X"], silent=True)])
+        flowing = _result(destinations=[_la_dest(["X"], silent=False)])
+        unknown = _result(destinations=[_la_dest(["X"])])  # liveness not assessed
+        no_la = _result(status="Missing")
+        self._evaluate(rules, [silent, flowing, unknown, no_la])
+        self.assertEqual(silent.policy_violations, ["must-flow"])
+        self.assertEqual(flowing.policy_violations, [])
+        self.assertEqual(unknown.policy_violations, [])
+        self.assertEqual(no_la.policy_violations, ["must-flow"])
+
+    def test_destination_region_same_and_unknown(self):
+        rules = """
+rules:
+  - name: same-region
+    require: { destination_region: same }
+"""
+        cross = _result(destinations=[_la_dest(["X"], region="westus")],
+                        location="eastus")
+        local = _result(destinations=[_la_dest(["X"], region="East US")],
+                        location="eastus")
+        unresolved = _result(destinations=[_la_dest(["X"], region="")],
+                             location="eastus")
+        self._evaluate(rules, [cross, local, unresolved])
+        self.assertEqual(cross.policy_violations, ["same-region"])
+        self.assertEqual(local.policy_violations, [])
+        self.assertEqual(unresolved.policy_violations, [])
+        # The evaluation-only helper key never leaks into report data
+        self.assertNotIn("_src_region", cross.destinations[0])
+
+    def test_workspace_rules(self):
+        rules = """
+rules:
+  - name: retention-90
+    scope: workspace
+    require: { retention_days_at_least: 90 }
+  - name: must-be-read
+    scope: workspace
+    require: { queried: true }
+  - name: cost-cap
+    scope: workspace
+    require: { max_monthly_cost: 100 }
+"""
+        short = _workspace(name="law-short", audit=True, queries=5)
+        short.retention_days = 30
+        unread = _workspace(name="law-unread", audit=True, queries=0)
+        unread.retention_days = 180
+        unknown = _workspace(name="law-unknown", audit=None, queries=None)
+        unknown.retention_days = 0  # config unknown
+        pricey = _workspace(name="law-pricey", audit=True, queries=5)
+        pricey.retention_days = 180
+        pricey.est_monthly_total = 250.0
+        self._evaluate(rules, [], [short, unread, unknown, pricey])
+        self.assertEqual(short.policy_violations, ["retention-90"])
+        self.assertEqual(unread.policy_violations, ["must-be-read"])
+        self.assertEqual(unknown.policy_violations, [])
+        self.assertEqual(pricey.policy_violations, ["cost-cap"])
+
+
+class PolicyIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        from dwml.checks import reset_extra_checks
+        self.addCleanup(reset_extra_checks)
+
+    def _register(self, yaml_rules=_POLICY_YAML):
+        import yaml as yaml_mod
+        from dwml.checks import register_checks
+        from dwml.policy import _validate_rule, make_checks
+        raw = yaml_mod.safe_load(yaml_rules)["rules"]
+        rules = []
+        seen = set()
+        for i, r in enumerate(raw):
+            rule = _validate_rule(r, i, seen)
+            seen.add(rule.name)
+            rules.append(rule)
+        checks = make_checks(rules)
+        register_checks(checks)
+        return rules, checks
+
+    def test_registration_and_exit_codes(self):
+        self._register()
+        from dwml import checks as registry
+        self.assertIn("kv-audit-to-la", registry.CHECK_NAMES)
+        # severity fail joins the CI default; warn does not
+        self.assertIn("kv-audit-to-la", registry.DEFAULT_FAIL_ON)
+        self.assertNotIn("no-legacy-tables", registry.DEFAULT_FAIL_ON)
+
+        violator = _kv_result("kv-bad")
+        violator.policy_violations = ["kv-audit-to-la"]
+        self.assertEqual(_determine_exit_code([violator], ci_mode=True), 1)
+        self.assertEqual(_determine_exit_code(
+            [violator], ci_mode=True, fail_on=("missing",)), 0)
+        self.assertFalse(is_healthy(violator))
+
+    def test_duplicate_name_rejected(self):
+        from dwml.checks import register_checks
+        from dwml.policy import PolicyRule, make_checks
+        clash = PolicyRule(name="missing", title="x", description="x",
+                           severity="fail", scope="resource",
+                           require={"diagnostics": True})
+        with self.assertRaises(ValueError):
+            register_checks(make_checks([clash]))
+
+    def test_reports_render_policy_sections_and_payload(self):
+        self._register()
+        violator = _kv_result("kv-bad")
+        violator.policy_violations = ["kv-audit-to-la"]
+        clean = _kv_result("kv-good", destinations=[_la_dest(["AuditEvent"])])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            html_out = Path(tmp_dir) / "r.html"
+            json_out = Path(tmp_dir) / "r.json"
+            md_out = Path(tmp_dir) / "r.md"
+            generate_html([violator, clean], str(html_out))
+            generate_json([violator, clean], str(json_out))
+            generate_markdown([violator, clean], str(md_out))
+            html_content = html_out.read_text(encoding="utf-8")
+            md_content = md_out.read_text(encoding="utf-8")
+            payload = json.loads(json_out.read_text(encoding="utf-8"))
+
+        self.assertIn("Key Vaults must ship AuditEvent to Log Analytics",
+                      html_content)
+        self.assertIn("Policy violations: kv-audit-to-la", html_content)
+        self.assertIn("| Key Vaults must ship AuditEvent to Log Analytics | 1 |",
+                      md_content)
+        self.assertEqual(
+            payload["summary"]["policy_violation_counts"]["kv-audit-to-la"], 1)
+        self.assertEqual(payload["policy"][0]["severity"], "fail")
+
+    def test_diff_compares_policy_findings(self):
+        from dwml.diffing import compute_diff
+        from dwml.reporting import build_payload
+        self._register()
+        clean = _kv_result("kv-1", destinations=[_la_dest(["AuditEvent"])])
+        old_payload = build_payload([clean])
+
+        violator = _kv_result("kv-1", destinations=[_la_dest(["Other"])])
+        violator.policy_violations = ["kv-audit-to-la"]
+        new_payload = build_payload([violator])
+
+        diff = compute_diff(old_payload, new_payload)
+        added = diff["checks"]["kv-audit-to-la"]["added"]
+        self.assertEqual([i["name"] for i in added], ["kv-1"])
+
+        # A rule recorded in only one report is skipped, not guessed
+        no_policy = build_payload([clean])
+        no_policy.pop("policy")
+        diff = compute_diff(no_policy, new_payload)
+        self.assertIn("kv-audit-to-la", diff["skipped"])
+        self.assertNotIn("kv-audit-to-la", diff["checks"])
+
+
 if __name__ == "__main__":
     unittest.main()

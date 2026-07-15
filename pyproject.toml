@@ -14,6 +14,7 @@ dependencies = [
     "azure-mgmt-monitor>=6.0.0,<7.0.0",
     "azure-mgmt-loganalytics",
     "azure-monitor-query",
+    "pyyaml",
 ]
 readme = "README.md"
 license = "MIT"

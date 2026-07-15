@@ -34,6 +34,7 @@ class DiagnosticResult:
     duplicate: bool = False
     error_message: str = ""
     est_monthly_impact: object = None  # USD estimate of waste, None = not computed
+    policy_violations: list = field(default_factory=list)  # violated policy rule names
 
 
 def has_dead_destination(result):

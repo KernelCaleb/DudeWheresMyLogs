@@ -26,6 +26,7 @@ On top of the checks, every scan maps where logs are going (Log Analytics, Stora
 
 ## Highlights
 
+- Policy checks: declare your own log health rules in YAML and they become first-class checks -- own report sections, CI categories, and diff support (see below)
 - Azure SDK native (no `az` CLI dependency), parallel scanning, automatic retry/backoff on ARM throttling -- built for enterprise-scale tenants
 - Graceful degradation everywhere: whatever the credential cannot see is reported as unknown, never guessed and never fatal to the scan
 - Self-contained HTML report (light and dark mode) with collapsible findings, a destination map, and the full machine-readable payload embedded inside
@@ -118,7 +119,41 @@ DudeWheresMyLogs diff old.json new.json -f md -o diff.md
 DudeWheresMyLogs diff old.json new.json --ci --fail-on missing,dead-destinations
 ```
 
-The diff shows per-check counts, which findings are new, which were resolved, and how estimated monthly spend and waste moved.
+The diff shows per-check counts, which findings are new, which were resolved, and how estimated monthly spend and waste moved. Policy rule results recorded in the reports are diffed too, no policy file needed.
+
+### Policy checks
+
+Declare your own rules in a YAML (or JSON) file and they become first-class checks: their own numbered report sections, summary lines, `--checks`/`--fail-on` category names, CI exit-code behavior, and diff support.
+
+```bash
+DudeWheresMyLogs -a --policy policies/baseline.yaml
+DudeWheresMyLogs -a --ci --policy myrules.yaml --fail-on kv-audit-to-la
+```
+
+```yaml
+rules:
+  - name: kv-audit-to-la
+    title: Key Vaults must ship AuditEvent to Log Analytics
+    severity: fail            # fail = CI-failing by default; warn/info report only
+    match: { type: "Microsoft.KeyVault/vaults" }   # wildcards; also name/resource_group/region/subscription
+    require:
+      categories: ["AuditEvent"]
+      destination_type: "Log Analytics"
+
+  - name: pipelines-must-flow
+    severity: warn
+    match: { type: "*" }
+    require: { flowing: true }     # data must actually arrive, not just be configured
+
+  - name: workspaces-must-be-read
+    severity: warn
+    scope: workspace
+    require: { queried: true }     # someone must have queried it in the lookback window
+```
+
+Resource rules can `require` diagnostics, categories (`allLogs` satisfies any), destination type/region (`same` = resource's own region), Log Analytics table mode, and `flowing`; they can `forbid` duplicates, cross-region or dead destinations, silent pipelines, destination types/regions, and the legacy `AzureDiagnostics` mode. Workspace rules can require minimum retention, query auditing, actual query activity, a daily cap, Sentinel on/off, and a maximum estimated monthly cost. Unknowns never violate: whatever the credential could not see is skipped, not flagged.
+
+**How this relates to Azure Policy:** Azure Policy owns enforcement of configuration intent -- deploy-time deny and auto-remediation. These rules assert what Azure Policy structurally cannot evaluate: whether data actually flows, whether anyone reads it, what it costs, and conditions aggregated across multiple diagnostic settings. Configuration-shaped rules are still useful here because this tool runs with plain Reader rights, where Policy assignment is not an option (auditors, consultants, assessments). A starter pack ships in [`policies/baseline.yaml`](policies/baseline.yaml).
 
 ### Options
 
@@ -133,8 +168,9 @@ The diff shows per-check counts, which findings are new, which were resolved, an
 | `--exclude-types` | Skip matching resource types (supports wildcards, repeatable) |
 | `--resource-group` | Only scan matching resource groups (supports wildcards, repeatable) |
 | `--ci` | Return `0` for clean, `1` for findings, `2` for scan errors |
-| `--checks` | Which checks to run and report (see the Checks table; default: all). Raw scan data in CSV/JSON is unaffected |
-| `--fail-on` | Finding categories that trigger exit code `1` in `--ci` mode; must be active checks (default: `missing,duplicates,dead-destinations,no-activity-log-export`) |
+| `--checks` | Which checks to run and report (see the Checks table, plus any `--policy` rule names; default: all). Raw scan data in CSV/JSON is unaffected |
+| `--fail-on` | Finding categories that trigger exit code `1` in `--ci` mode; must be active checks (default: `missing,duplicates,dead-destinations,no-activity-log-export` plus severity-`fail` policy rules) |
+| `--policy` | Policy file (YAML or JSON) with custom rules; repeatable. Rules become first-class checks |
 | `--lookback-days` | Lookback window for workspace usage analysis (default: 30) |
 | `--price-file` | JSON price table overriding the built-in East US list prices used for cost estimates |
 | `--summary-only` | Omit per-resource detail for healthy/informational sections in HTML and Markdown reports |

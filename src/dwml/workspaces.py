@@ -15,7 +15,7 @@ unknown, never guessed and never fatal to the scan.
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 try:
@@ -81,6 +81,7 @@ class WorkspaceUsage:
     est_monthly_total: object = None
     lookback_days: int = 30
     access_error: str = ""
+    policy_violations: list = field(default_factory=list)  # violated policy rule names
 
 
 def workspace_status(ws):

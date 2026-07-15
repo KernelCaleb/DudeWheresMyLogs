@@ -4,7 +4,8 @@ import sys
 from collections import Counter
 
 from . import __version__
-from .checks import CHECK_NAMES, DEFAULT_FAIL_ON, get_check, get_checks
+from . import checks as checks_registry
+from .checks import get_check, get_checks
 from .reporting import generate_report
 from .term import Console
 
@@ -87,7 +88,8 @@ def build_parser():
         action="append",
         metavar="CHECK",
         help="Finding checks to run and report. "
-             f"Choices: {', '.join(CHECK_NAMES)}. "
+             f"Choices: {', '.join(checks_registry.CHECK_NAMES)} "
+             "plus any --policy rule names. "
              "Repeatable or comma-separated. Default: all checks.",
     )
     parser.add_argument(
@@ -95,9 +97,19 @@ def build_parser():
         action="append",
         metavar="CATEGORY",
         help="Finding categories that count as findings in --ci mode. "
-             f"Choices: {', '.join(CHECK_NAMES)}. "
+             f"Choices: {', '.join(checks_registry.CHECK_NAMES)} "
+             "plus any --policy rule names. "
              "Repeatable or comma-separated. Must be active checks. "
-             f"Default: {','.join(DEFAULT_FAIL_ON)}.",
+             f"Default: {','.join(checks_registry.DEFAULT_FAIL_ON)} "
+             "plus severity-fail policy rules.",
+    )
+    parser.add_argument(
+        "--policy",
+        action="append",
+        metavar="FILE",
+        help="Policy file (YAML or JSON) with custom log health rules. "
+             "Rules become first-class checks with their own report "
+             "sections, --fail-on names, and CI behavior. Repeatable.",
     )
     parser.add_argument(
         "--summary-only",
@@ -185,7 +197,7 @@ def _determine_exit_code(results, ci_mode=False, fail_on=None, ws_results=None,
         "workspace": ws_results or [],
         "subscription": sub_audits or [],
     }
-    categories = DEFAULT_FAIL_ON if fail_on is None else fail_on
+    categories = checks_registry.DEFAULT_FAIL_ON if fail_on is None else fail_on
     for category in categories:
         check = get_check(category)
         if any(check.detect(item) for item in pools[check.scope]):
@@ -196,13 +208,13 @@ def _determine_exit_code(results, ci_mode=False, fail_on=None, ws_results=None,
 def _parse_checks(values, parser):
     """Validate --checks values; returns a tuple of check names (all if unset)."""
     if not values:
-        return CHECK_NAMES
+        return checks_registry.CHECK_NAMES
     names = _normalize_patterns(values)
-    invalid = [c for c in names if c not in CHECK_NAMES]
+    invalid = [c for c in names if c not in checks_registry.CHECK_NAMES]
     if invalid:
         parser.error(
             f"invalid --checks value: {', '.join(invalid)} "
-            f"(choose from {', '.join(CHECK_NAMES)})"
+            f"(choose from {', '.join(checks_registry.CHECK_NAMES)})"
         )
     return tuple(dict.fromkeys(names))
 
@@ -210,13 +222,13 @@ def _parse_checks(values, parser):
 def _parse_fail_on(values, parser, active_checks):
     """Validate --fail-on values against active checks; returns a tuple of names."""
     if not values:
-        return tuple(c for c in DEFAULT_FAIL_ON if c in active_checks)
+        return tuple(c for c in checks_registry.DEFAULT_FAIL_ON if c in active_checks)
     categories = _normalize_patterns(values)
-    invalid = [c for c in categories if c not in CHECK_NAMES]
+    invalid = [c for c in categories if c not in checks_registry.CHECK_NAMES]
     if invalid:
         parser.error(
             f"invalid --fail-on category: {', '.join(invalid)} "
-            f"(choose from {', '.join(CHECK_NAMES)})"
+            f"(choose from {', '.join(checks_registry.CHECK_NAMES)})"
         )
     inactive = [c for c in categories if c not in active_checks]
     if inactive:
@@ -270,6 +282,18 @@ def run(argv=None):
 
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Policy rules register as checks BEFORE --checks/--fail-on validation,
+    # so rule names are first-class category names everywhere
+    policy_rules = ()
+    if args.policy:
+        from .policy import PolicyError, load_policy_files, make_checks
+        try:
+            policy_rules = load_policy_files(args.policy)
+            checks_registry.register_checks(make_checks(policy_rules))
+        except (PolicyError, ValueError) as e:
+            parser.error(f"--policy: {e}")
+
     active_checks = _parse_checks(args.checks, parser)
     fail_on = _parse_fail_on(args.fail_on, parser, active_checks)
 
@@ -348,9 +372,15 @@ def run(argv=None):
     # Workspace usage analysis: needed by workspace-scope checks and by the
     # resource-scope silent-resources reconciliation
     ws_results = []
+    seen_map = {}
+    policy_needs_ws = False
+    if policy_rules:
+        from .policy import rules_need_workspace_analysis
+        policy_needs_ws = rules_need_workspace_analysis(policy_rules)
     needs_ws_analysis = (
         get_checks(active_checks, scope="workspace")
         or "silent-resources" in active_checks
+        or policy_needs_ws
     )
     if needs_ws_analysis:
         console.phase("Analyzing destination workspaces",
@@ -361,7 +391,7 @@ def run(argv=None):
             credential, all_results,
             max_workers=args.workers, lookback_days=args.lookback_days,
         )
-        if "silent-resources" in active_checks:
+        if "silent-resources" in active_checks or policy_needs_ws:
             flag_silent_resources(all_results, seen_map)
         try:
             prices = load_prices(args.price_file)
@@ -370,6 +400,10 @@ def run(argv=None):
             prices = None
         if prices:
             estimate_costs(all_results, ws_results, seen_map, prices)
+
+    if policy_rules:
+        from .policy import evaluate_policy
+        evaluate_policy(policy_rules, all_results, ws_results)
 
     # Print summary
     status_counts = Counter(r.status for r in all_results)
