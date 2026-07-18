@@ -45,6 +45,32 @@ list`), so merely listing vaults makes them look active.
 A full lab scan in `--ci` mode must exit `1` (findings). Scoping to
 `--include-types "Microsoft.Network/*" --fail-on duplicates` must exit `0`.
 
+## Policy ground truth (v3.0)
+
+`policy-groundtruth.yaml` maps one policy rule to each expected lab
+misconfiguration, plus negative controls. Run:
+
+```bash
+DudeWheresMyLogs -s <sub-id> --resource-group rg-dwml-lab \
+    --policy lab/policy-groundtruth.yaml
+```
+
+| Rule | Expected violations |
+|------|--------------------|
+| `kv-audit-to-la` | `kvmiss*` (no settings), `kvdead*` (only LA destination is dead) |
+| `kv-logs-stay-home` | `kvcross*` only; `kvdup*`/`kvok*` are negative controls |
+| `no-storage-sink` | `kvdup*` (ships to `stdwml*`) |
+| `nsg-must-log` | `nsg-dwml-missing` |
+| `kv-must-flow` | `kvmiss*`/`kvdead*` always; other vaults fire while ingestion lags, then clear (~5-30 min) |
+| `ws-retention-90` | all three live workspaces (30-day retention) |
+| `ws-must-be-read` | `law-dwml-secondary`; `law-dwml-primary` until an unmarked query lands; `law-dwml-west` SKIPPED (auditing off = unknown) |
+| `kv-dedicated-tables` | `kvcross*`, `kvdead*`, `kvdup*`, `kvok*` -- ARM reports the legacy AzureDiagnostics mode explicitly on KV settings (observed live 2026-07-17). The blob setting reports no mode and must stay unflagged (unknown never violates) |
+| `blob-logs-must-flow` | `stdwml*/blob` -- configured but permanently silent; proves the known-silent violation branch |
+| `ws-no-sentinel` | nobody -- no Sentinel in the lab |
+
+CI behavior: `--ci --policy lab/policy-groundtruth.yaml --fail-on nsg-must-log`
+must exit `1`; `--fail-on ws-no-sentinel` must exit `0`.
+
 ## Notes
 
 - Deleting the resource group alone leaves workspaces soft-deleted for 14

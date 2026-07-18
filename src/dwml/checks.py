@@ -30,6 +30,7 @@ class Check:
     dest_label: str = ""   # Markdown destination column header ("" = no column)
     dest_filter: object = None  # callable(dest dict) -> bool for that column
     scope: str = "resource"  # "resource" (DiagnosticResult) or "workspace" (WorkspaceUsage)
+    policy_severity: str = ""  # "fail"/"warn"/"info" for policy-defined checks, "" = built-in
 
 
 CHECKS = (
@@ -137,9 +138,48 @@ CHECKS = (
     ),
 )
 
+_STATIC_CHECKS = CHECKS
+_EXTRA_CHECKS = ()
+
 CHECK_NAMES = tuple(c.name for c in CHECKS)
 DEFAULT_FAIL_ON = tuple(c.name for c in CHECKS if c.default_fail_on)
 _BY_NAME = {c.name: c for c in CHECKS}
+
+
+def _rebuild():
+    global CHECKS, CHECK_NAMES, DEFAULT_FAIL_ON, _BY_NAME
+    CHECKS = _STATIC_CHECKS + _EXTRA_CHECKS
+    CHECK_NAMES = tuple(c.name for c in CHECKS)
+    DEFAULT_FAIL_ON = tuple(c.name for c in CHECKS if c.default_fail_on)
+    _BY_NAME = {c.name: c for c in CHECKS}
+
+
+def register_checks(extra):
+    """Register additional checks (policy rules) for this process.
+
+    Registered checks join the registry everywhere: --checks/--fail-on
+    validation, report sections, summary lines, payload counts, and CI exit
+    codes. Names must not collide with built-in or already-registered checks.
+    """
+    global _EXTRA_CHECKS
+    extra = tuple(extra)
+    for check in extra:
+        if check.name in _BY_NAME:
+            raise ValueError(f"check name already registered: {check.name}")
+    _EXTRA_CHECKS = _EXTRA_CHECKS + extra
+    _rebuild()
+
+
+def extra_checks():
+    """The currently registered non-built-in checks (policy rules)."""
+    return _EXTRA_CHECKS
+
+
+def reset_extra_checks():
+    """Remove all registered extra checks (used by tests)."""
+    global _EXTRA_CHECKS
+    _EXTRA_CHECKS = ()
+    _rebuild()
 
 
 def get_checks(names=None, scope=None):

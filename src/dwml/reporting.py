@@ -6,7 +6,7 @@ from dataclasses import asdict
 from datetime import datetime
 
 from . import __version__
-from .checks import get_checks, is_healthy
+from .checks import extra_checks, get_checks, is_healthy
 from .costs import export_fee_destinations, fmt_usd
 from .diagnostics import has_cross_region, has_dead_destination
 from .workspaces import workspace_status
@@ -91,6 +91,16 @@ def build_payload(results, ws_results=None, sub_audits=None):
         payload["summary"]["no_activity_log_export_count"] = sum(
             1 for s in sub_audits if s.exported is False)
         payload["subscription_audits"] = [asdict(s) for s in sub_audits]
+    extras = extra_checks()
+    if extras:
+        pools = {"resource": results, "workspace": ws_results or []}
+        payload["policy"] = [
+            {"name": c.name, "title": c.title,
+             "severity": c.policy_severity, "scope": c.scope}
+            for c in extras]
+        payload["summary"]["policy_violation_counts"] = {
+            c.name: sum(1 for item in pools[c.scope] if c.detect(item))
+            for c in extras}
     return payload
 
 
@@ -110,6 +120,7 @@ def generate_csv(results, output):
         "Duplicate",
         "Dead Destination",
         "Cross Region",
+        "Policy Violations",
         "Error",
     ]
 
@@ -143,6 +154,7 @@ def generate_csv(results, output):
                 "Duplicate": "Yes" if r.duplicate else "",
                 "Dead Destination": "Yes" if has_dead_destination(r) else "",
                 "Cross Region": "Yes" if has_cross_region(r) else "",
+                "Policy Violations": "; ".join(r.policy_violations),
                 "Error": r.error_message,
             })
 
@@ -993,6 +1005,10 @@ def generate_html(results, output, summary_only=False, checks=None, ws_results=N
             cols_class = "row-cols-4"
 
         expand_parts = [f'<div class="full-id">{e(r.resource_id)}</div>']
+        if r.policy_violations:
+            expand_parts.append(
+                '<div class="empty-state">Policy violations: '
+                f"{e(', '.join(r.policy_violations))}</div>")
         if r.est_monthly_impact is not None:
             expand_parts.append(
                 '<div class="empty-state">Estimated monthly waste: '

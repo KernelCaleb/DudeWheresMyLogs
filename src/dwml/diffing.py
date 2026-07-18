@@ -105,25 +105,47 @@ def compute_diff(old, new):
         "costs": {},
     }
 
-    for check in CHECKS:
-        if old_pools[check.scope] is None or new_pools[check.scope] is None:
-            diff["skipped"].append(check.name)
-            continue
+    def _check_diff(title, detect, scope):
         old_items = dict(
-            _item_key_label(i, check.scope)
-            for i in old_pools[check.scope] if check.detect(i))
+            _item_key_label(i, scope) for i in old_pools[scope] if detect(i))
         new_items = dict(
-            _item_key_label(i, check.scope)
-            for i in new_pools[check.scope] if check.detect(i))
+            _item_key_label(i, scope) for i in new_pools[scope] if detect(i))
         added = [new_items[k] for k in sorted(new_items.keys() - old_items.keys())]
         resolved = [old_items[k] for k in sorted(old_items.keys() - new_items.keys())]
-        diff["checks"][check.name] = {
-            "title": check.title,
+        return {
+            "title": title,
             "old_count": len(old_items),
             "new_count": len(new_items),
             "added": added,
             "resolved": resolved,
         }
+
+    for check in CHECKS:
+        if old_pools[check.scope] is None or new_pools[check.scope] is None:
+            diff["skipped"].append(check.name)
+            continue
+        diff["checks"][check.name] = _check_diff(
+            check.title, check.detect, check.scope)
+
+    # Policy rules: compared by name when both reports carry the rule.
+    # Detection replays from the recorded policy_violations lists, so no
+    # policy file is needed to diff.
+    old_rules = {p["name"]: p for p in old.get("policy", [])}
+    new_rules = {p["name"]: p for p in new.get("policy", [])}
+    for name in [*old_rules, *[n for n in new_rules if n not in old_rules]]:
+        if name not in old_rules or name not in new_rules:
+            diff["skipped"].append(name)
+            continue
+        meta = new_rules[name]
+        scope = meta.get("scope", "resource")
+        if (scope not in ("resource", "workspace")
+                or old_pools[scope] is None or new_pools[scope] is None):
+            diff["skipped"].append(name)
+            continue
+        diff["checks"][name] = _check_diff(
+            meta.get("title") or name,
+            lambda item, n=name: n in (getattr(item, "policy_violations", None) or ()),
+            scope)
 
     for key in ("est_monthly_spend_usd", "est_monthly_waste_usd"):
         old_v = old.get("summary", {}).get(key)
@@ -309,8 +331,10 @@ def build_diff_parser():
         action="append",
         metavar="CATEGORY",
         help="Categories that count as regressions in --ci mode. "
-             f"Choices: {', '.join(CHECK_NAMES)}. Repeatable or "
-             f"comma-separated. Default: {','.join(DEFAULT_FAIL_ON)}.",
+             f"Choices: {', '.join(CHECK_NAMES)} plus any policy rule "
+             "names recorded in the reports. Repeatable or comma-separated. "
+             f"Default: {','.join(DEFAULT_FAIL_ON)} plus severity-fail "
+             "policy rules.",
     )
     return parser
 
@@ -320,21 +344,27 @@ def run_diff(argv):
     parser = build_diff_parser()
     args = parser.parse_args(argv)
 
-    fail_on = list(DEFAULT_FAIL_ON)
-    if args.fail_on:
-        fail_on = [part.strip() for value in args.fail_on
-                   for part in value.split(",") if part.strip()]
-        invalid = [c for c in fail_on if c not in CHECK_NAMES]
-        if invalid:
-            parser.error(f"invalid --fail-on category: {', '.join(invalid)} "
-                         f"(choose from {', '.join(CHECK_NAMES)})")
-
     try:
         old = load_payload(args.old)
         new = load_payload(args.new)
     except (OSError, ValueError, json.JSONDecodeError) as e:
         sys.stderr.write(f"Error: {e}\n")
         return 2
+
+    policy_names = {p["name"] for payload in (old, new)
+                    for p in payload.get("policy", [])}
+    policy_fail = {p["name"] for payload in (old, new)
+                   for p in payload.get("policy", [])
+                   if p.get("severity") == "fail"}
+    fail_on = list(DEFAULT_FAIL_ON) + sorted(policy_fail)
+    if args.fail_on:
+        fail_on = [part.strip() for value in args.fail_on
+                   for part in value.split(",") if part.strip()]
+        valid = set(CHECK_NAMES) | policy_names
+        invalid = [c for c in fail_on if c not in valid]
+        if invalid:
+            parser.error(f"invalid --fail-on category: {', '.join(invalid)} "
+                         f"(choose from {', '.join(sorted(valid))})")
 
     diff = compute_diff(old, new)
 

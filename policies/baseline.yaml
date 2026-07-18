@@ -1,0 +1,74 @@
+# DudeWheresMyLogs starter policy.
+#
+# These rules deliberately lean into what Azure Policy cannot evaluate:
+# whether data actually flows, whether anyone reads it, and what it costs.
+# Copy this file, keep what fits your environment, and run with:
+#
+#   DudeWheresMyLogs -a --policy policies/baseline.yaml
+#
+# severity: fail  -> counts toward --ci exit code 1 by default
+# severity: warn  -> reported, never fails CI unless named in --fail-on
+# severity: info  -> reported quietly
+#
+# Unknowns never violate: anything the credential cannot see (unresolved
+# regions, unqueryable workspaces, missing cost data) is skipped.
+
+version: 1
+rules:
+  # --- Assertions Azure Policy structurally cannot make -------------------
+
+  - name: keyvault-logs-must-flow
+    title: Key Vault audit logs must actually arrive
+    description: >
+      Key Vaults shipping to Log Analytics must show data landed in the
+      lookback window. A configured-but-silent audit pipeline is worse than
+      a missing one, because dashboards say it works.
+    severity: warn
+    match: { type: "Microsoft.KeyVault/vaults" }
+    require: { flowing: true }
+
+  - name: workspaces-must-be-read
+    title: Workspaces receiving logs must be queried
+    description: >
+      A destination workspace nobody queried in the lookback window is spend
+      without detection value. Query auditing must be on for this to be
+      assessable; unassessable workspaces are skipped, not flagged.
+    severity: warn
+    scope: workspace
+    require: { queried: true }
+
+  - name: workspace-cost-ceiling
+    title: No workspace above $1000/month estimated
+    description: >
+      List-price estimate of ingestion plus retention overage. Raise or
+      lower the ceiling to taste; this exists to surface surprises, not to
+      enforce a budget.
+    severity: info
+    scope: workspace
+    require: { max_monthly_cost: 1000 }
+
+  # --- Configuration rules (useful when you only have Reader rights) ------
+
+  - name: keyvault-audit-to-la
+    title: Key Vaults must ship AuditEvent to Log Analytics
+    severity: fail
+    match: { type: "Microsoft.KeyVault/vaults" }
+    require:
+      categories: ["AuditEvent"]
+      destination_type: "Log Analytics"
+
+  - name: no-legacy-azurediagnostics
+    title: Log Analytics destinations must use dedicated tables
+    description: >
+      The legacy AzureDiagnostics table has a 500-column limit and worse
+      query ergonomics; resource-specific (Dedicated) tables are the
+      recommended mode and enable cheaper Basic-tier plans on some tables.
+    severity: warn
+    match: { type: "*" }
+    forbid: { la_destination_type: "AzureDiagnostics" }
+
+  - name: workspace-retention-minimum
+    title: Workspaces must retain data at least 90 days
+    severity: warn
+    scope: workspace
+    require: { retention_days_at_least: 90 }
