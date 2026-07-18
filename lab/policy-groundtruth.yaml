@@ -1,0 +1,96 @@
+# Policy ground truth for the verification lab.
+#
+# Run after deploy.sh + seed.sh:
+#   DudeWheresMyLogs -s <lab-sub> --resource-group rg-dwml-lab \
+#       --policy lab/policy-groundtruth.yaml
+#
+# Expected violations (see lab/README.md for the full table):
+#   kv-audit-to-la          -> kvmiss* (no settings), kvdead* (only LA dest is dead)
+#   kv-logs-stay-home       -> kvcross* only (kvdup*/kvok* are negative controls)
+#   no-storage-sink         -> kvdup* (ships to stdwml*)
+#   nsg-must-log            -> nsg-dwml-missing
+#   kv-must-flow            -> kvmiss*, kvdead* always; kvdup*/kvcross*/kvok*
+#                              fire while ingestion lags, then clear (~5-30 min)
+#   ws-retention-90         -> all three live workspaces (30d retention)
+#   ws-must-be-read         -> law-dwml-secondary; law-dwml-primary until an
+#                              unmarked query lands; law-dwml-west SKIPPED
+#                              (auditing off = unknown, never flagged)
+#   kv-dedicated-tables     -> kvcross*, kvdead*, kvdup*, kvok* (ARM reports
+#                              AzureDiagnostics mode explicitly on KV
+#                              settings -- observed live 2026-07-17); the
+#                              blob setting reports NO mode and must stay
+#                              unflagged (unknown never violates)
+#   blob-logs-must-flow     -> stdwml*/blob (configured, forever silent):
+#                              proves the known-silent violation branch
+#   ws-no-sentinel          -> nobody (no Sentinel in the lab)
+
+version: 1
+rules:
+  - name: kv-audit-to-la
+    title: Key Vaults must ship AuditEvent to Log Analytics
+    severity: fail
+    match: { type: "Microsoft.KeyVault/vaults" }
+    require:
+      categories: ["AuditEvent"]
+      destination_type: "Log Analytics"
+
+  - name: kv-logs-stay-home
+    title: Key Vault logs must stay in the vault's region
+    severity: warn
+    match:
+      type: "Microsoft.KeyVault/vaults"
+      name: ["kvcross*", "kvdup*", "kvok*"]
+    require: { destination_region: same }
+
+  - name: no-storage-sink
+    title: Key Vaults must not ship logs to storage accounts
+    severity: warn
+    match: { type: "Microsoft.KeyVault/vaults" }
+    forbid: { destination_type: "Storage Account" }
+
+  - name: nsg-must-log
+    title: NSGs must have diagnostic settings
+    severity: fail
+    match: { type: "Microsoft.Network/networkSecurityGroups" }
+    require: { diagnostics: true }
+
+  - name: kv-must-flow
+    title: Key Vault audit data must actually arrive
+    severity: warn
+    match: { type: "Microsoft.KeyVault/vaults" }
+    require: { flowing: true }
+
+  - name: ws-retention-90
+    title: Workspaces must retain at least 90 days
+    severity: warn
+    scope: workspace
+    require: { retention_days_at_least: 90 }
+
+  - name: ws-must-be-read
+    title: Workspaces receiving logs must be queried
+    severity: warn
+    scope: workspace
+    require: { queried: true }
+
+  # ARM reports the legacy mode explicitly on KV settings, so this fires on
+  # every shipping vault; the blob setting (mode unreported) is the
+  # unknown-never-violates control
+  - name: kv-dedicated-tables
+    title: Log Analytics destinations must use dedicated tables
+    severity: info
+    match: { type: "*" }
+    forbid: { la_destination_type: "AzureDiagnostics" }
+
+  # The blob service is configured to ship but no blob operation ever
+  # happens: a permanent known-silent pipeline
+  - name: blob-logs-must-flow
+    title: Blob diagnostics must deliver data
+    severity: info
+    match: { type: "Microsoft.Storage/*", name: "*/blob" }
+    require: { flowing: true }
+
+  - name: ws-no-sentinel
+    title: Negative control - no Sentinel expected in the lab
+    severity: info
+    scope: workspace
+    require: { sentinel: false }
